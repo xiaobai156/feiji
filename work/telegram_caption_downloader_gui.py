@@ -10,12 +10,15 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 import webbrowser
 from uuid import uuid4
@@ -23,7 +26,7 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
-from tkinter import BooleanVar, StringVar, TclError, Tk, Toplevel, filedialog, messagebox, simpledialog
+from tkinter import BooleanVar, Frame, StringVar, TclError, Tk, Toplevel, filedialog, messagebox, simpledialog
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from ctypes import wintypes
@@ -38,15 +41,18 @@ APP_DATA = (
     / "运行数据"
 )
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.2.5"
+APP_VERSION = "v5.2.9"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DEFAULT_OUTPUT_PATH = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果")
-DOWNLOAD_CONCURRENCY = 16
+DOWNLOAD_CONCURRENCY = 6
 SPECIAL_RETRY_GROUP = "嫣然心水"
 SPECIAL_ADJACENT_LABEL = "乖乖团队"
 YANRAN_ADJACENT_LABELS = {"乖乖团队", "天机阁特围", "天机阁杀料", "恩平"}
 YANRAN_FIRST_IMAGE_OCR_LABELS = {"天机阁特围", "天机阁杀料"}
+# Calibrated against the 2026-09-23 Tianji images and other same-day categories.
+TIANJI_MIN_COLOR_INTERSECTION = 0.70
+TIANJI_MAX_ASPECT_RATIO = 1.20
 VISUAL_ADJACENT_EXTENSION_GROUPS = 2
 HUANGDAXIAN_GROUP = "黄大仙新澳"
 HUANGDAXIAN_OCR_LABELS = {"战狼", "68", "红人馆", "香奈儿"}
@@ -60,21 +66,42 @@ XINAO_EXPERT_UNWANTED_MARKERS = {
     "平特一肖", "赚钱六肖", "五肖", "五码", "小数+双数",
 }
 STATUS_OUTPUT_DIR = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\outputs\抓取状态")
-DARK_BG = "#17191D"
-DARK_SIDEBAR = "#1C1F24"
-DARK_SURFACE = "#202329"
-DARK_FIELD = "#272B32"
-DARK_BORDER = "#343A43"
-DARK_TEXT = "#F3F4F6"
-DARK_MUTED = "#A4ABB5"
-DARK_ACCENT = "#2F8CFF"
-DARK_DANGER = "#FF5B57"
-DARK_SUCCESS = "#55C840"
+DARK_BG = "#161719"
+DARK_SURFACE = "#1B1D20"
+DARK_FIELD = "#222428"
+DARK_FIELD_RO = "#1E2124"
+DARK_BORDER = "#33363B"
+DARK_BORDER_SOFT = "#26292D"
+DARK_TEXT = "#E8EAED"
+DARK_MUTED = "#9AA0A6"
+DARK_DIM = "#6E747B"
+DARK_ACCENT = "#E8A33D"
+DARK_ACCENT_SOFT = "#3A301C"
+DARK_DANGER = "#E0715B"
+DARK_SUCCESS = "#7CC47F"
+DARK_LOG_BG = "#111214"
+DARK_BOTTOM = "#121315"
 FORM_FONT = ("Microsoft YaHei UI", 13)
 RUNTIME_LOG_DIR_NAME = "运行日志"
+UI_SETTINGS_NAME = "ui_settings.json"
+WINDOW_PRESETS = {"2k": (1440, 860), "1080": (1440, 860)}
 WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))
 }
+UI_HEARTBEAT_SECONDS = 1.0
+UI_FREEZE_SECONDS = 5.0
+UI_FREEZE_DUMP_COOLDOWN = 30.0
+
+
+def thread_stack_dump() -> str:
+    """Snapshot every live thread, so a frozen UI thread can still be diagnosed afterwards."""
+    frames = sys._current_frames()
+    blocks = []
+    for thread in threading.enumerate():
+        frame = frames.get(thread.ident)
+        header = f"--- 线程 {thread.name}（daemon={thread.daemon}）"
+        blocks.append(header if frame is None else header + "\n" + "".join(traceback.format_stack(frame)))
+    return "\n".join(blocks)
 
 
 class TelegramRuntimeLogHandler(logging.Handler):
@@ -141,7 +168,10 @@ def logged_telegram_client(session, api_id, api_hash, write_log):
     client = None
     try:
         resolved = session if isinstance(session, Session) else load_account_session(session, write_log)
-        client = TelegramClient(resolved, api_id, api_hash, base_logger=logger)
+        client = TelegramClient(
+            resolved, api_id, api_hash, base_logger=logger,
+            timeout=15, connection_retries=2, retry_delay=1,
+        )
         yield client
     finally:
         try:
@@ -367,6 +397,28 @@ def save_selected_account(app_data: Path, account_id: str) -> None:
     os.replace(temporary, path)
 
 
+def load_window_preset(app_data: Path) -> str:
+    path = Path(app_data) / UI_SETTINGS_NAME
+    if not path.is_file():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    preset = payload.get("window_preset") if isinstance(payload, dict) else None
+    return preset if preset in WINDOW_PRESETS else ""
+
+
+def save_window_preset(app_data: Path, preset: str) -> None:
+    if preset not in WINDOW_PRESETS:
+        raise ValueError("窗口分辨率选项无效")
+    path = Path(app_data) / UI_SETTINGS_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps({"window_preset": preset}, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def create_account_profile(app_data: Path, name: str, api_id: int, api_hash: str, phone: str) -> dict:
     name = normalized(name)
     if not name or len(name) > 80:
@@ -534,11 +586,13 @@ def _write_group_settings(program_root: Path, settings: dict) -> None:
     os.replace(temporary, path)
 
 
-def load_group_settings(program_root: Path) -> dict:
-    path = group_directory(program_root) / GROUP_SETTINGS_NAME
+def load_group_settings(program_root: Path, *, read_only: bool = False) -> dict:
+    group_root = Path(program_root) / GROUP_DIR_NAME
+    path = group_root / GROUP_SETTINGS_NAME
     if not path.is_file():
         settings = _default_group_settings()
-        _write_group_settings(program_root, settings)
+        if not read_only:
+            _write_group_settings(program_root, settings)
         return settings
     payload = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(payload, dict) or not isinstance(payload.get("groups"), list):
@@ -576,8 +630,9 @@ def load_group_settings(program_root: Path) -> dict:
         settings["selected_group"] = payload["selected_group"]
     if isinstance(payload.get("output_path"), str) and payload["output_path"].strip():
         settings["output_path"] = payload["output_path"]
-    for item in groups:
-        migrate_group_notes_config(program_root, item["name"])
+    if not read_only:
+        for item in groups:
+            migrate_group_notes_config(program_root, item["name"])
     return settings
 
 
@@ -706,6 +761,17 @@ def notes_for_retry(notes: dict[str, str], status: dict | None) -> dict[str, str
     return {keyword: label for keyword, label in notes.items() if label not in completed}
 
 
+def _notes_from_entries(entries) -> dict[str, str]:
+    notes: dict[str, str] = {}
+    for line in entries:
+        aliases = [normalized(part) for part in line.split("/") if part.strip()]
+        if aliases:
+            canonical = aliases[0]
+            for alias in aliases:
+                notes.setdefault(alias, canonical)
+    return notes
+
+
 def load_notes(path: Path, allow_empty: bool = False) -> dict[str, str]:
     if path.suffix.casefold() == ".json":
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -714,16 +780,32 @@ def load_notes(path: Path, allow_empty: bool = False) -> dict[str, str]:
         entries = _clean_keyword_entries(payload["keywords"])
     else:
         entries = path.read_text(encoding="utf-8-sig").splitlines()
-    notes: dict[str, str] = {}
-    for line in entries:
-        aliases = [normalized(part) for part in line.split("/") if part.strip()]
-        if aliases:
-            canonical = aliases[0]
-            for alias in aliases:
-                notes.setdefault(alias, canonical)
+    notes = _notes_from_entries(entries)
     if not notes and not allow_empty:
         raise ValueError("备注名单是空的")
     return notes
+
+
+def load_group_notes(path: Path) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """Load the group's default notes and the optional per-link exclusive notes."""
+    default_notes = load_notes(path, allow_empty=True)
+    address_notes: dict[str, dict[str, str]] = {}
+    if path.suffix.casefold() != ".json":
+        return default_notes, address_notes
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    links = payload.get("links") if isinstance(payload, dict) else None
+    if links is None:
+        return default_notes, address_notes
+    if not isinstance(links, dict):
+        raise ValueError("备注 JSON 的 links 必须是 {链接: 备注数组}")
+    for address, entries in links.items():
+        if not isinstance(address, str) or not address.strip() or not isinstance(entries, list):
+            raise ValueError("备注 JSON 的 links 必须是 {链接: 备注数组}")
+        notes = _notes_from_entries(_clean_keyword_entries(entries))
+        if not notes:
+            raise ValueError(f"备注 JSON 的 links「{address.strip()}」是空的")
+        address_notes[address.strip()] = notes
+    return default_notes, address_notes
 
 
 def parse_day(value: str) -> date:
@@ -1040,8 +1122,8 @@ def ocr_labels_from_payload(payload: bytes, labels: set[str], ocr_engine=None, o
         "红人馆": ("红人馆", "紅人館"),
         "香奈儿": ("香奈儿", "香奈兒"),
         # Tianji adjacent matching deliberately uses only this short marker.
-        "天机阁特围": ("天机阁", "天機閣"),
-        "天机阁杀料": ("天机阁", "天機閣"),
+        "天机阁特围": ("天机阁", "天機閣", "天机"),
+        "天机阁杀料": ("天机阁", "天機閣", "天机"),
     }
     matched = set()
     for label in labels:
@@ -1061,6 +1143,7 @@ def collect_adjacent_first_preview_messages(
     selection: dict[int, set[str]],
     labels: set[str],
     bidirectional_labels: set[str] | None = None,
+    checked_pairs: set[tuple[int, int]] | None = None,
 ) -> set[int]:
     """Return only the first image ID from each requested adjacent group."""
     messages = list(messages)
@@ -1082,6 +1165,8 @@ def collect_adjacent_first_preview_messages(
                     candidate = groups[neighbor_index]
                     if any(selection.get(message.id, set()).intersection(labels) for message in candidate):
                         continue
+                    if checked_pairs and (_first_media_message(group).id, _first_media_message(candidate).id) in checked_pairs:
+                        continue
                     preview_ids.add(_first_media_message(candidate).id)
     return preview_ids
 
@@ -1095,6 +1180,9 @@ def add_first_image_ocr_immediate_groups(
     ocr_engine=None,
     bidirectional_labels: set[str] | None = None,
     detected_labels: set[str] | None = None,
+    checked_pairs: set[tuple[int, int]] | None = None,
+    ocr_cache: dict | None = None,
+    group_similarity=None,
     log=None,
     on_progress=None,
 ) -> dict[int, set[str]]:
@@ -1107,6 +1195,7 @@ def add_first_image_ocr_immediate_groups(
     bidirectional_labels = bidirectional_labels or set()
     requests: dict[int, set[str]] = defaultdict(set)
     candidate_groups: dict[int, list] = {}
+    candidate_anchors: dict[int, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     for index, group in enumerate(groups):
         matched_labels = {
             label
@@ -1123,8 +1212,11 @@ def add_first_image_ocr_immediate_groups(
                     if any(selection.get(message.id, set()).intersection(labels) for message in candidate):
                         continue
                     first = _first_media_message(candidate)
+                    if checked_pairs and (_first_media_message(group).id, first.id) in checked_pairs:
+                        continue
                     requests[first.id].add(label)
                     candidate_groups[first.id] = candidate
+                    candidate_anchors[first.id][label].append(group)
 
     total = len(requests)
     messages_by_id = {message.id: message for message in messages}
@@ -1134,14 +1226,19 @@ def add_first_image_ocr_immediate_groups(
         first = messages_by_id[first_id]
         if not payload:
             raise OcrError(f"相邻组首图缺失：消息 {first_id}；无法完成 OCR，本次任务已中止")
-        hits = ocr_labels_from_payload(
-            payload,
-            detected_labels if detected_labels is not None else requested_labels,
-            ocr_engine,
-            on_error=lambda error, m=first: log and log(
-                f"【识别】OCR失败：{media_group_description([m])}（{error}）"
-            ),
-        )
+        target_labels = detected_labels if detected_labels is not None else requested_labels
+        cache_key = (first_id, frozenset(target_labels))
+        if ocr_cache is not None and cache_key in ocr_cache:
+            hits = ocr_cache[cache_key]
+        else:
+            hits = ocr_labels_from_payload(
+                payload, target_labels, ocr_engine,
+                on_error=lambda error, m=first: log and log(
+                    f"【识别】OCR失败：{media_group_description([m])}（{error}）"
+                ),
+            )
+            if ocr_cache is not None:
+                ocr_cache[cache_key] = hits
         candidate = candidate_groups[first_id]
         labels_to_add = hits if detected_labels is not None else requested_labels.intersection(hits)
         if detected_labels is not None:
@@ -1156,9 +1253,22 @@ def add_first_image_ocr_immediate_groups(
                 if log:
                     log(
                         f"【识别】{label} 相邻组首图 OCR：{media_group_description(candidate)}；"
-                        + (f"命中“天机阁”，整组 {len(candidate)} 张归入 {label}"
-                           if label in labels_to_add else "未识别到“天机阁”，不据此归类")
+                        + (f"命中天机阁/天機閣/天机，整组 {len(candidate)} 张归入 {label}"
+                           if label in labels_to_add else "首图未命中天机阁/天機閣/天机")
                     )
+        for label in requested_labels - labels_to_add:
+            if group_similarity:
+                similar = any(group_similarity(anchor, candidate)
+                              for anchor in candidate_anchors[first_id][label])
+                if similar:
+                    labels_to_add.add(label)
+                if log:
+                    log(f"【识别】{label} 相邻组相似度补抓：{media_group_description(candidate)}；"
+                        + (f"相似，整组 {len(candidate)} 张归入 {label}" if similar
+                           else "首图和相似度均未命中，不从此组继续扩展"))
+        if checked_pairs is not None:
+            checked_pairs.update((_first_media_message(anchor).id, first_id)
+                                 for anchors in candidate_anchors[first_id].values() for anchor in anchors)
         for label in labels_to_add:
             for message in candidate:
                 selection[message.id].add(label)
@@ -1244,7 +1354,10 @@ def image_color_signature(payload: bytes) -> tuple[tuple[float, ...], float] | N
     return tuple(value / total for value in histogram), aspect
 
 
-def image_groups_are_similar(anchor_payloads: list[bytes], candidate_payloads: list[bytes]) -> bool:
+def image_groups_are_similar(
+    anchor_payloads: list[bytes], candidate_payloads: list[bytes],
+    *, min_intersection: float = 0.60, max_aspect_ratio: float = 1.35,
+) -> bool:
     anchors = [signature for payload in anchor_payloads if (signature := image_color_signature(payload))]
     candidates = [signature for payload in candidate_payloads if (signature := image_color_signature(payload))]
     if not anchors or not candidates:
@@ -1255,7 +1368,7 @@ def image_groups_are_similar(anchor_payloads: list[bytes], candidate_payloads: l
         for anchor_histogram, anchor_aspect in anchors:
             aspect_ratio = max(aspect, anchor_aspect) / max(min(aspect, anchor_aspect), 0.01)
             intersection = sum(min(left, right) for left, right in zip(histogram, anchor_histogram))
-            if aspect_ratio <= 1.35 and intersection >= 0.60:
+            if aspect_ratio <= max_aspect_ratio and intersection >= min_intersection:
                 return True
         return False
 
@@ -1315,17 +1428,20 @@ class TelegramDownloaderApp:
         show_account_dialog: bool = True,
         program_root: Path | None = None,
         status_root: Path | None = None,
+        workflow_log: Path | None = None,
     ):
         self.root = root
         self.app_data = app_data
         self.program_root = Path(program_root) if program_root else runtime_root()
         self.status_root = Path(status_root) if status_root else STATUS_OUTPUT_DIR
+        self._workflow_log_path = Path(workflow_log).expanduser() if workflow_log else None
         try:
             self.settings = load_group_settings(self.program_root)
         except (OSError, ValueError, json.JSONDecodeError):
             self.settings = _default_group_settings()
         self.root.title(f"登录飞机提取图片 {APP_VERSION}")
-        window_width, window_height = 1240, 820
+        self.window_preset = self._initial_window_preset()
+        window_width, window_height = self._window_size_for_preset(self.window_preset)
         window_x = max((self.root.winfo_screenwidth() - window_width) // 2, 0)
         window_y = max((self.root.winfo_screenheight() - window_height) // 2, 0)
         self.root.geometry(f"{window_width}x{window_height}+{window_x}+{window_y}")
@@ -1345,6 +1461,11 @@ class TelegramDownloaderApp:
         self._log_day: date | None = None
         self._log_group = "系统"
         self._log_rollover_id = None
+        self._ui_queue: queue.Queue = queue.Queue()
+        self._ui_pump_id = None
+        self._login_token = ""
+        self._ui_heartbeat = time.monotonic()
+        self._watchdog_stop = threading.Event()
 
         self.style = ttk.Style(root)
         self.style.theme_use("clam")
@@ -1364,17 +1485,23 @@ class TelegramDownloaderApp:
         self.account_status = StringVar(master=root, value="未登录，请选择账号")
         self.task_status = StringVar(master=root, value="等待操作")
         self.first_capture_status = StringVar(master=root, value="今日未首抓")
+        self.progress_summary = StringVar(master=root, value="")
         self._capture_started = None
         self._capture_timer = None
         self._capture_generation = 0
+        self._workflow_mode = False
+        self._workflow_group = ""
+        self._workflow_exit_code: int | None = None
         self.root.bind("<Destroy>", self._on_capture_window_destroyed, add="+")
 
         self._build_ui()
         self.refresh_account_profiles()
         self._load_runtime_log()
         self._schedule_log_rollover()
+        self._pump_ui_callbacks()
         self.root.after_idle(lambda: self._enable_dark_title_bar(self.root))
         self.reload_group_profiles(self.chat.get())
+        self._start_freeze_watchdog()
         if show_account_dialog:
             # Idle callbacks can run while the main window still has a 1x1 geometry.
             self._startup_account_pending = True
@@ -1411,7 +1538,6 @@ class TelegramDownloaderApp:
         style.configure(".", font=("Microsoft YaHei UI", 12))
         style.configure("TFrame", background=DARK_BG)
         style.configure("Dark.TFrame", background=DARK_BG)
-        style.configure("Sidebar.TFrame", background=DARK_SIDEBAR)
         style.configure("Card.TFrame", background=DARK_SURFACE, relief="flat")
         style.configure("TLabel", background=DARK_BG, foreground=DARK_TEXT, font=("Microsoft YaHei UI", 13))
         style.configure("Card.TLabel", background=DARK_SURFACE, foreground=DARK_TEXT, font=("Microsoft YaHei UI", 13))
@@ -1422,10 +1548,18 @@ class TelegramDownloaderApp:
         style.configure("Online.TLabel", background=DARK_BG, foreground=DARK_SUCCESS, font=("Segoe UI", 12, "bold"))
         style.configure("Offline.TLabel", background=DARK_BG, foreground=DARK_MUTED, font=("Segoe UI", 12, "bold"))
         style.configure("Status.TLabel", background=DARK_SURFACE, foreground=DARK_TEXT, font=("Microsoft YaHei UI", 12, "bold"))
-        style.configure("FirstCapturePending.TLabel", background=DARK_BG, foreground=DARK_MUTED, font=("Microsoft YaHei UI", 12, "bold"))
-        style.configure("FirstCaptureDone.TLabel", background=DARK_BG, foreground=DARK_SUCCESS, font=("Microsoft YaHei UI", 12, "bold"))
-        style.configure("SidebarTitle.TLabel", background=DARK_SIDEBAR, foreground=DARK_TEXT, font=("Microsoft YaHei UI", 15, "bold"))
-        style.configure("SidebarHint.TLabel", background=DARK_SIDEBAR, foreground=DARK_MUTED, font=("Microsoft YaHei UI", 12))
+        style.configure("FirstCapturePending.TLabel", background=DARK_SURFACE, foreground=DARK_ACCENT, font=("Microsoft YaHei UI", 12, "bold"))
+        style.configure("FirstCaptureDone.TLabel", background=DARK_SURFACE, foreground=DARK_SUCCESS, font=("Microsoft YaHei UI", 12, "bold"))
+        style.configure("Brand.TLabel", background=DARK_BG, foreground=DARK_TEXT, font=("Microsoft YaHei UI", 15, "bold"))
+        style.configure("BrandSub.TLabel", background=DARK_BG, foreground="#D6DAE0", font=("Microsoft YaHei UI", 13))
+        style.configure("Workspace.TLabel", background=DARK_BG, foreground=DARK_ACCENT, font=("Microsoft YaHei UI", 11))
+        style.configure("PanelNo.TLabel", background=DARK_SURFACE, foreground=DARK_ACCENT, font=("Segoe UI", 20, "bold"))
+        style.configure("PanelTitle.TLabel", background=DARK_SURFACE, foreground=DARK_TEXT, font=("Microsoft YaHei UI", 15, "bold"))
+        style.configure("PanelSection.TLabel", background=DARK_SURFACE, foreground=DARK_MUTED, font=("Microsoft YaHei UI", 11))
+        style.configure("PanelField.TLabel", background=DARK_SURFACE, foreground=DARK_MUTED, font=("Microsoft YaHei UI", 12))
+        style.configure("BottomKey.TLabel", background=DARK_BOTTOM, foreground=DARK_DIM, font=("Microsoft YaHei UI", 11))
+        style.configure("BottomValue.TLabel", background=DARK_BOTTOM, foreground="#CFD3D8", font=("Microsoft YaHei UI", 11))
+        style.configure("BottomHint.TLabel", background=DARK_BOTTOM, foreground="#8A9097", font=("Microsoft YaHei UI", 12))
 
         style.configure(
             "TButton",
@@ -1437,30 +1571,47 @@ class TelegramDownloaderApp:
             padding=(16, 9),
             relief="flat",
         )
-        style.map("TButton", background=[("active", "#303640"), ("disabled", "#22262C")], foreground=[("disabled", "#666D77")])
-        style.configure("Accent.TButton", background=DARK_ACCENT, foreground="#FFFFFF", bordercolor=DARK_ACCENT, padding=(22, 11), font=("Microsoft YaHei UI", 12, "bold"))
-        style.map("Accent.TButton", background=[("active", "#4B9CFF"), ("pressed", "#247BE1"), ("disabled", "#254F7F")])
-        style.configure("Danger.TButton", background=DARK_SURFACE, foreground=DARK_DANGER, bordercolor=DARK_SURFACE, padding=(8, 6))
-        style.map("Danger.TButton", background=[("active", "#31262A")], foreground=[("active", "#FF7773")])
-        style.configure("Nav.TButton", background=DARK_SIDEBAR, foreground=DARK_MUTED, bordercolor=DARK_SIDEBAR, padding=(18, 14), anchor="center")
-        style.map("Nav.TButton", background=[("active", "#252A31")], foreground=[("active", DARK_TEXT)])
-        style.configure("SelectedNav.TButton", background="#252B34", foreground=DARK_ACCENT, bordercolor="#252B34", padding=(18, 14), anchor="center", font=("Microsoft YaHei UI", 12, "bold"))
+        style.map("TButton", background=[("active", "#33373C"), ("disabled", "#232529")], foreground=[("disabled", DARK_DIM)])
+        style.configure("Tool.TButton", padding=(14, 9), font=("Microsoft YaHei UI", 12))
+        style.map("Tool.TButton", background=[("active", "#33373C"), ("disabled", "#232529")], foreground=[("disabled", DARK_DIM)])
+        style.configure("Small.TButton", padding=(10, 7), font=("Microsoft YaHei UI", 12))
+        style.map("Small.TButton", background=[("active", "#33373C"), ("disabled", "#232529")], foreground=[("disabled", DARK_DIM)])
+        style.configure("Preset.TButton", padding=(16, 7), font=("Microsoft YaHei UI", 12))
+        style.map("Preset.TButton", background=[("active", "#33373C"), ("disabled", "#232529")], foreground=[("disabled", DARK_DIM)])
+        style.configure("PresetActive.TButton", background=DARK_ACCENT, foreground="#241A08", bordercolor=DARK_ACCENT, padding=(16, 7), font=("Microsoft YaHei UI", 12, "bold"))
+        style.map("PresetActive.TButton", background=[("active", "#F0B355"), ("disabled", "#6B5527")], foreground=[("disabled", "#3A2E12")])
+        style.configure("Accent.TButton", background=DARK_ACCENT, foreground="#241A08", bordercolor=DARK_ACCENT, padding=(22, 12), font=("Microsoft YaHei UI", 12, "bold"))
+        style.map("Accent.TButton", background=[("active", "#F0B355"), ("pressed", "#D18F2C"), ("disabled", "#6B5527")], foreground=[("disabled", "#3A2E12")])
+        style.configure("Danger.TButton", background=DARK_SURFACE, foreground=DARK_DANGER, bordercolor=DARK_BORDER, padding=(14, 9), font=("Microsoft YaHei UI", 12))
+        style.map("Danger.TButton", background=[("active", "#2B2527")], foreground=[("active", "#F08A76"), ("disabled", DARK_DIM)])
 
         style.configure("TEntry", fieldbackground=DARK_FIELD, foreground=DARK_TEXT, insertcolor=DARK_TEXT, bordercolor=DARK_BORDER, padding=9, font=("Microsoft YaHei UI", 13))
         style.configure("Dark.TEntry", fieldbackground=DARK_FIELD, foreground=DARK_TEXT, insertcolor=DARK_TEXT, bordercolor=DARK_BORDER, padding=9, font=("Microsoft YaHei UI", 13))
-        style.map("Dark.TEntry", fieldbackground=[("readonly", DARK_FIELD), ("disabled", "#22262C")], foreground=[("readonly", DARK_TEXT), ("disabled", "#777E88")])
+        style.map("Dark.TEntry", fieldbackground=[("readonly", DARK_FIELD_RO), ("disabled", "#232529")], foreground=[("readonly", "#AEB3B9"), ("disabled", DARK_DIM)])
         style.configure("TCombobox", fieldbackground=DARK_FIELD, background=DARK_FIELD, foreground=DARK_TEXT, arrowcolor=DARK_MUTED, bordercolor=DARK_BORDER, padding=8, font=("Microsoft YaHei UI", 13))
         style.configure("Dark.TCombobox", fieldbackground=DARK_FIELD, background=DARK_FIELD, foreground=DARK_TEXT, arrowcolor=DARK_MUTED, bordercolor=DARK_BORDER, padding=8, font=("Microsoft YaHei UI", 13))
-        style.map("Dark.TCombobox", fieldbackground=[("readonly", DARK_FIELD), ("disabled", "#22262C")], foreground=[("readonly", DARK_TEXT), ("disabled", "#777E88")])
+        style.map("Dark.TCombobox", fieldbackground=[("readonly", DARK_FIELD), ("disabled", "#232529")], foreground=[("readonly", DARK_TEXT), ("disabled", DARK_DIM)])
         style.configure("TCheckbutton", background=DARK_BG, foreground=DARK_TEXT, font=("Microsoft YaHei UI", 13))
-        style.map("TCheckbutton", background=[("active", DARK_BG)], foreground=[("disabled", "#777E88")])
+        style.map("TCheckbutton", background=[("active", DARK_BG)], foreground=[("disabled", DARK_DIM)])
         style.configure("TLabelframe", background=DARK_BG, foreground=DARK_TEXT, bordercolor=DARK_BORDER)
         style.configure("TLabelframe.Label", background=DARK_BG, foreground=DARK_TEXT)
         style.configure("Treeview", background=DARK_SURFACE, fieldbackground=DARK_SURFACE, foreground=DARK_TEXT, bordercolor=DARK_BORDER, rowheight=34, font=("Microsoft YaHei UI", 12))
-        style.map("Treeview", background=[("selected", "#225E9F")], foreground=[("selected", "#FFFFFF")])
+        style.map("Treeview", background=[("selected", DARK_ACCENT_SOFT)], foreground=[("selected", "#F0C070")])
         style.configure("Treeview.Heading", background=DARK_FIELD, foreground=DARK_TEXT, relief="flat", font=("Microsoft YaHei UI", 12, "bold"))
-        style.map("Treeview.Heading", background=[("active", "#303640")])
-        style.configure("Dark.TSeparator", background=DARK_BORDER)
+        style.map("Treeview.Heading", background=[("active", "#33373C")])
+        style.configure("Dark.TSeparator", background=DARK_BORDER_SOFT)
+        style.configure("Dark.Vertical.TScrollbar", background="#3B424C", troughcolor=DARK_FIELD, bordercolor=DARK_FIELD, arrowcolor=DARK_MUTED)
+        style.configure("DarkList.Treeview", background=DARK_FIELD, fieldbackground=DARK_FIELD, foreground=DARK_TEXT,
+                        bordercolor=DARK_BORDER, rowheight=27, font=("Microsoft YaHei UI", 13), relief="flat")
+        style.map("DarkList.Treeview", background=[("selected", DARK_ACCENT_SOFT)], foreground=[("selected", "#F0C070")])
+        style.layout("DarkList.Treeview", [
+            ("Treeview.field", {"sticky": "nswe", "border": 1, "children": [
+                ("Treeview.padding", {"sticky": "nswe", "children": [
+                    ("Treeview.treearea", {"sticky": "nswe"}),
+                ]}),
+            ]}),
+        ])
+        style.configure("Dark.Horizontal.TProgressbar", background=DARK_ACCENT, troughcolor="#2A2D31", bordercolor=DARK_BORDER, lightcolor=DARK_ACCENT, darkcolor=DARK_ACCENT, thickness=9)
 
     @staticmethod
     def _enable_dark_title_bar(window) -> None:
@@ -1497,134 +1648,164 @@ class TelegramDownloaderApp:
         shell = ttk.Frame(self.root, style="Dark.TFrame")
         shell.pack(fill="both", expand=True)
 
-        self.sidebar = ttk.Frame(shell, style="Sidebar.TFrame", width=128)
-        self.sidebar.pack(side="left", fill="y")
-        self.sidebar.pack_propagate(False)
-        ttk.Label(self.sidebar, text="✈", style="SidebarTitle.TLabel", font=("Segoe UI Symbol", 24)).pack(pady=(24, 8))
-        ttk.Label(self.sidebar, text="飞机抓图", style="SidebarTitle.TLabel").pack(pady=(0, 24))
-        self.extract_nav = ttk.Button(self.sidebar, text="提取", style="SelectedNav.TButton")
-        self.extract_nav.pack(fill="x", padx=10, pady=(0, 8))
-        self.group_nav = ttk.Button(self.sidebar, text="群组", style="Nav.TButton", command=self.open_group_settings)
-        self.group_nav.pack(fill="x", padx=10, pady=8)
-        self.history_nav = ttk.Button(self.sidebar, text="历史", style="Nav.TButton", command=self.open_output)
-        self.history_nav.pack(fill="x", padx=10, pady=8)
-        self.settings_nav = ttk.Button(self.sidebar, text="设置", style="Nav.TButton", command=self.open_login_settings)
-        self.settings_nav.pack(fill="x", padx=10, pady=8)
-        ttk.Label(self.sidebar, text=f"版本 {APP_VERSION.removeprefix('v')}", style="SidebarHint.TLabel").pack(side="bottom", pady=20)
-
-        main = ttk.Frame(shell, style="Dark.TFrame", padding=(30, 22, 30, 18))
-        main.pack(side="left", fill="both", expand=True)
-
-        header = ttk.Frame(main, style="Dark.TFrame")
+        header = ttk.Frame(shell, style="Dark.TFrame", padding=(22, 14, 22, 12))
         header.pack(fill="x")
-        ttk.Label(header, text="飞机图片提取器", style="Title.TLabel").pack(anchor="w")
-        connection = ttk.Frame(header, style="Dark.TFrame")
-        connection.pack(fill="x", pady=(5, 0))
-        self.connection_indicator = ttk.Label(connection, text="●", style="Offline.TLabel")
-        self.connection_indicator.pack(side="left")
-        ttk.Label(connection, text="Telegram", style="Hint.TLabel").pack(side="left", padx=(8, 6))
-        ttk.Label(connection, textvariable=self.account_status, style="Hint.TLabel").pack(side="left")
-        self.account_button = ttk.Button(connection, text="选择账号 / 登录", command=self.open_login_settings)
-        self.account_button.pack(side="right")
+        brand = ttk.Frame(header, style="Dark.TFrame")
+        brand.pack(side="left")
+        ttk.Label(brand, text="飞机抓图", style="Brand.TLabel").pack(side="left")
+        ttk.Label(brand, text=" / 本地提取工作室", style="BrandSub.TLabel").pack(side="left")
 
-        ttk.Separator(main, orient="horizontal", style="Dark.TSeparator").pack(fill="x", pady=(20, 18))
-        ttk.Label(main, text="新建提取任务", style="Section.TLabel").pack(anchor="w", pady=(0, 12))
+        account = ttk.Frame(header, style="Dark.TFrame")
+        account.pack(side="right")
+        ttk.Label(account, text="TELEGRAM · 本地工作区", style="Workspace.TLabel").pack(side="right")
+        self.account_button = ttk.Button(account, text="切换账号", style="Small.TButton", command=self.open_login_settings)
+        self.account_button.pack(side="right", padx=(12, 14))
+        ttk.Label(account, textvariable=self.account_status, style="Hint.TLabel").pack(side="right")
+        self.connection_indicator = ttk.Label(account, text="●", style="Offline.TLabel")
+        self.connection_indicator.pack(side="right", padx=(0, 8))
 
-        forms = ttk.Frame(main, style="Dark.TFrame")
-        forms.pack(fill="x")
-        forms.columnconfigure(0, weight=1, uniform="task_cards")
-        forms.columnconfigure(1, weight=1, uniform="task_cards")
+        Frame(shell, background=DARK_BORDER_SOFT, height=1).pack(fill="x")
 
-        left_card = ttk.Frame(forms, style="Card.TFrame", padding=18)
-        left_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        left_card.columnconfigure(1, weight=1)
-        ttk.Label(left_card, text="群配置", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
-        self.group_combo = ttk.Combobox(
-            left_card, textvariable=self.chat, state="readonly", style="Dark.TCombobox", font=FORM_FONT
+        panel = Frame(shell, background=DARK_SURFACE, highlightbackground=DARK_BORDER, highlightthickness=1)
+        panel.pack(fill="both", expand=True, padx=22, pady=(16, 0))
+        panel.grid_columnconfigure(0, weight=10, uniform="panel_cols")
+        panel.grid_columnconfigure(2, weight=11, uniform="panel_cols")
+        panel.grid_columnconfigure(4, weight=13, uniform="panel_cols")
+        panel.grid_rowconfigure(0, weight=1)
+        for column in (1, 3):
+            Frame(panel, background=DARK_BORDER_SOFT, width=1).grid(row=0, column=column, sticky="ns", pady=16)
+
+        col1 = Frame(panel, background=DARK_SURFACE)
+        col1.grid(row=0, column=0, sticky="nsew", padx=(20, 14), pady=16)
+        head1 = Frame(col1, background=DARK_SURFACE)
+        head1.pack(fill="x", pady=(0, 14))
+        ttk.Label(head1, text="01", style="PanelNo.TLabel").pack(side="left")
+        ttk.Label(head1, text="选择群组", style="PanelTitle.TLabel").pack(side="left", padx=(10, 0), pady=(5, 0))
+        ttk.Label(col1, text="资料群组", style="PanelSection.TLabel").pack(anchor="w", pady=(0, 6))
+        list_wrap = Frame(col1, background=DARK_SURFACE)
+        list_wrap.pack(fill="x")
+        self.group_list = ttk.Treeview(
+            list_wrap,
+            columns=("pad", "name"),
+            show="headings",
+            selectmode="browse",
+            height=7,
+            style="DarkList.Treeview",
+            takefocus=False,
         )
-        self.group_combo.grid(row=0, column=1, sticky="ew", pady=5)
-        self.group_combo.bind("<<ComboboxSelected>>", self.on_group_selected)
-        group_button = ttk.Button(left_card, text="设置…", command=self.open_group_settings)
-        group_button.grid(row=0, column=2, padx=(8, 0), pady=5)
-
-        ttk.Label(left_card, text="抓取日期", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=5)
-        day_entry = ttk.Entry(left_card, textvariable=self.day, style="Dark.TEntry", font=FORM_FONT)
-        day_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=5)
-
-        ttk.Label(left_card, text="时间范围", style="Card.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=5)
-        time_entry = ttk.Entry(
-            left_card, textvariable=self.time_range, state="readonly", style="Dark.TEntry", font=FORM_FONT
+        self.group_list.heading("pad", text="")
+        self.group_list.column("pad", anchor="w", stretch=False, width=12, minwidth=12)
+        self.group_list.heading("name", text="")
+        self.group_list.column("name", anchor="w", stretch=True, width=180)
+        self.group_list.tag_configure("captured", foreground=DARK_DANGER)
+        self.group_list.pack(side="left", fill="both", expand=True)
+        list_scroll = ttk.Scrollbar(
+            list_wrap, orient="vertical", style="Dark.Vertical.TScrollbar", command=self.group_list.yview
         )
-        time_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=5)
+        list_scroll.pack(side="right", fill="y", padx=(6, 0))
+        self.group_list.configure(yscrollcommand=list_scroll.set)
+        self.group_list.bind("<<TreeviewSelect>>", self.on_group_list_selected)
+        ttk.Label(col1, text="工具", style="PanelSection.TLabel").pack(anchor="w", pady=(16, 6))
+        self.group_button = ttk.Button(col1, text="群组设置", style="Tool.TButton", command=self.open_group_settings)
+        self.group_button.pack(fill="x", pady=4)
+        self.status_button = ttk.Button(col1, text="查看抓取状态", style="Tool.TButton", command=self.open_capture_status)
+        self.status_button.pack(fill="x", pady=4)
+        self.open_button = ttk.Button(col1, text="打开结果", style="Tool.TButton", command=self.open_output)
+        self.open_button.pack(fill="x", pady=4)
+        self.settings_button = ttk.Button(col1, text="设置", style="Tool.TButton", command=self.open_login_settings)
+        self.settings_button.pack(fill="x", pady=4)
 
-        right_card = ttk.Frame(forms, style="Card.TFrame", padding=18)
-        right_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        right_card.columnconfigure(1, weight=1)
-        ttk.Label(right_card, text="备注 JSON", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
-        notes_entry = ttk.Entry(
-            right_card, textvariable=self.notes_path, state="readonly", style="Dark.TEntry", font=FORM_FONT
-        )
-        notes_entry.grid(row=0, column=1, sticky="ew", pady=5)
-        notes_button = ttk.Button(right_card, text="打开备注", command=self.open_notes_file)
-        notes_button.grid(row=0, column=2, padx=(8, 0), pady=5)
-        ttk.Label(right_card, text="保存位置", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=5)
-        output_entry = ttk.Entry(right_card, textvariable=self.output_path, style="Dark.TEntry", font=FORM_FONT)
-        output_entry.grid(row=1, column=1, sticky="ew", pady=5)
-        output_button = ttk.Button(right_card, text="浏览", command=self.choose_output)
-        output_button.grid(row=1, column=2, padx=(8, 0), pady=5)
-        ttk.Label(right_card, text="keywords 为空时抓取全部图片", style="CardHint.TLabel").grid(
-            row=2, column=1, columnspan=2, sticky="w", pady=(10, 5)
-        )
+        col2 = Frame(panel, background=DARK_SURFACE)
+        col2.grid(row=0, column=2, sticky="nsew", padx=16, pady=16)
+        head2 = Frame(col2, background=DARK_SURFACE)
+        head2.pack(fill="x", pady=(0, 14))
+        ttk.Label(head2, text="02", style="PanelNo.TLabel").pack(side="left")
+        ttk.Label(head2, text="核对与提取", style="PanelTitle.TLabel").pack(side="left", padx=(10, 0), pady=(5, 0))
 
-        actions = ttk.Frame(main, style="Dark.TFrame")
-        actions.pack(fill="x", pady=14)
-        self.start_button = ttk.Button(actions, text="开始精准提取", style="Accent.TButton", command=self.start_download)
-        self.start_button.pack(side="left")
-        self.retry_button = ttk.Button(actions, text="复抓", command=self.retry_capture)
-        self.open_button = ttk.Button(actions, text="打开结果", command=self.open_output)
+        ttk.Label(col2, text="提取账号", style="PanelField.TLabel").pack(anchor="w")
+        account_entry = ttk.Entry(col2, textvariable=self.account_status, state="readonly", style="Dark.TEntry", font=FORM_FONT)
+        account_entry.pack(fill="x", pady=(4, 10))
+        ttk.Label(col2, text="抓取日期", style="PanelField.TLabel").pack(anchor="w")
+        day_entry = ttk.Entry(col2, textvariable=self.day, style="Dark.TEntry", font=FORM_FONT)
+        day_entry.pack(fill="x", pady=(4, 10))
+        ttk.Label(col2, text="时间范围", style="PanelField.TLabel").pack(anchor="w")
+        time_entry = ttk.Entry(col2, textvariable=self.time_range, state="readonly", style="Dark.TEntry", font=FORM_FONT)
+        time_entry.pack(fill="x", pady=(4, 10))
+        ttk.Label(col2, text="备注 JSON", style="PanelField.TLabel").pack(anchor="w")
+        notes_row = Frame(col2, background=DARK_SURFACE)
+        notes_row.pack(fill="x", pady=(4, 10))
+        notes_entry = ttk.Entry(notes_row, textvariable=self.notes_path, state="readonly", style="Dark.TEntry", font=FORM_FONT)
+        notes_entry.pack(side="left", fill="x", expand=True)
+        notes_button = ttk.Button(notes_row, text="打开", style="Small.TButton", command=self.open_notes_file)
+        notes_button.pack(side="left", padx=(8, 0))
+        ttk.Label(col2, text="保存位置", style="PanelField.TLabel").pack(anchor="w")
+        output_row = Frame(col2, background=DARK_SURFACE)
+        output_row.pack(fill="x", pady=(4, 10))
+        output_entry = ttk.Entry(output_row, textvariable=self.output_path, style="Dark.TEntry", font=FORM_FONT)
+        output_entry.pack(side="left", fill="x", expand=True)
+        output_button = ttk.Button(output_row, text="浏览", style="Small.TButton", command=self.choose_output)
+        output_button.pack(side="left", padx=(8, 0))
         self.first_capture_status_label = ttk.Label(
-            actions, textvariable=self.first_capture_status, style="FirstCapturePending.TLabel"
+            col2, textvariable=self.first_capture_status, style="FirstCapturePending.TLabel"
         )
-        self.first_capture_status_label.pack(side="left", padx=(16, 0))
-        self.open_button.pack(side="right")
+        self.first_capture_status_label.pack(anchor="w", pady=(4, 10))
+        self.retry_button = ttk.Button(col2, text="复抓", style="Tool.TButton", command=self.retry_capture)
+        self.retry_button.pack(fill="x", side="bottom")
+        self.start_button = ttk.Button(col2, text="开始精准提取", style="Accent.TButton", command=self.start_download)
+        self.start_button.pack(fill="x", side="bottom", pady=(0, 18))
 
-        status_panel = ttk.Frame(main, style="Card.TFrame", padding=(18, 13))
-        status_panel.pack(fill="x", pady=(0, 12))
-        ttk.Label(status_panel, text="任务状态", style="CardHint.TLabel").pack(side="left")
-        ttk.Label(status_panel, textvariable=self.task_status, style="Status.TLabel").pack(side="right")
-
-        log_panel = ttk.Frame(main, style="Card.TFrame", padding=(1, 1, 1, 1))
-        log_panel.pack(fill="both", expand=True)
-        log_header = ttk.Frame(log_panel, style="Card.TFrame", padding=(16, 8))
-        log_header.pack(fill="x")
-        ttk.Label(log_header, text="运行日志", style="Card.TLabel", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
-        self.clear_button = ttk.Button(log_header, text="清除结果", style="Danger.TButton", command=self.clear_output)
-        self.clear_button.pack(side="right")
+        col3 = Frame(panel, background=DARK_SURFACE)
+        col3.grid(row=0, column=4, sticky="nsew", padx=(14, 20), pady=16)
+        head3 = Frame(col3, background=DARK_SURFACE)
+        head3.pack(fill="x", pady=(0, 14))
+        ttk.Label(head3, text="03", style="PanelNo.TLabel").pack(side="left")
+        ttk.Label(head3, text="结果与日志", style="PanelTitle.TLabel").pack(side="left", padx=(10, 0), pady=(5, 0))
+        ttk.Label(col3, text="任务状态", style="PanelField.TLabel").pack(anchor="w")
+        task_entry = ttk.Entry(col3, textvariable=self.task_status, state="readonly", style="Dark.TEntry", font=FORM_FONT)
+        task_entry.pack(fill="x", pady=(4, 10))
         self.log_box = ScrolledText(
-            log_panel,
+            col3,
             height=10,
             font=("Microsoft YaHei UI", 12),
             state="disabled",
-            background="#15171A",
+            background=DARK_LOG_BG,
             foreground=DARK_TEXT,
             insertbackground=DARK_TEXT,
-            selectbackground="#225E9F",
+            selectbackground="#4A3A1E",
             selectforeground="#FFFFFF",
             relief="flat",
             borderwidth=0,
-            highlightthickness=0,
-            padx=14,
+            highlightthickness=1,
+            highlightbackground=DARK_BORDER,
+            padx=12,
             pady=8,
         )
         self.log_box.pack(fill="both", expand=True)
         try:
-            self.log_box.vbar.configure(background=DARK_FIELD, troughcolor="#15171A", activebackground="#3B424C")
+            self.log_box.vbar.configure(background=DARK_FIELD, troughcolor=DARK_LOG_BG, activebackground="#3B424C")
         except TclError:
             pass
+        self.clear_button = ttk.Button(col3, text="清除结果", style="Danger.TButton", command=self.clear_output)
+        self.clear_button.pack(fill="x", pady=(10, 0))
+
+        Frame(shell, background=DARK_BORDER_SOFT, height=1).pack(fill="x", pady=(16, 0))
+        bottom = Frame(shell, background=DARK_BOTTOM)
+        bottom.pack(fill="x")
+        bottom_row = Frame(bottom, background=DARK_BOTTOM)
+        bottom_row.pack(fill="x", padx=22, pady=9)
+        ttk.Label(bottom_row, text="处理进度", style="BottomKey.TLabel").pack(side="left")
+        self.progress_bar = ttk.Progressbar(
+            bottom_row, mode="determinate", maximum=100, length=240, style="Dark.Horizontal.TProgressbar"
+        )
+        self.progress_bar.pack(side="left", padx=(8, 10))
+        ttk.Label(bottom_row, textvariable=self.progress_summary, style="BottomValue.TLabel").pack(side="left")
+        ttk.Label(bottom_row, text="关键词为空时提取该群当天全部图片", style="BottomHint.TLabel").pack(side="right")
+
         self.busy_widgets.extend(
             [
-                self.group_combo,
-                group_button,
+                self.group_button,
+                self.status_button,
+                self.retry_button,
                 day_entry,
                 time_entry,
                 notes_entry,
@@ -1633,11 +1814,8 @@ class TelegramDownloaderApp:
                 output_button,
                 self.start_button,
                 self.open_button,
+                self.settings_button,
                 self.clear_button,
-                self.retry_button,
-                self.group_nav,
-                self.history_nav,
-                self.settings_nav,
                 self.account_button,
             ]
         )
@@ -1661,14 +1839,19 @@ class TelegramDownloaderApp:
 
     def reload_group_profiles(self, preferred: str = "") -> None:
         names = [item["name"] for item in self.settings.get("groups", [])]
-        self.group_combo.configure(values=names)
+        self.group_list.delete(*self.group_list.get_children())
+        for name in names:
+            self.group_list.insert("", "end", iid=name, values=("", name))
         selected = preferred if preferred in names else self.settings.get("selected_group", "")
         if selected not in names:
             selected = names[0] if names else ""
         self.chat.set(selected)
+        if selected in names:
+            self.group_list.selection_set(selected)
+            self.group_list.see(selected)
         self._set_log_group(selected or "系统")
         self.settings["selected_group"] = selected
-        self.notes_path.set(str(group_notes_path(self.program_root, selected)) if selected else "请点击“设置…”添加群配置")
+        self.notes_path.set(str(group_notes_path(self.program_root, selected)) if selected else "请点击“群组设置”添加群配置")
         profile = self.selected_group_profile(required=False)
         self.time_range.set(
             f"{profile['start_time']} ～ {profile['end_time']}" if profile else "请先添加群配置"
@@ -1687,6 +1870,19 @@ class TelegramDownloaderApp:
     def selected_group_address(self) -> str:
         return self.selected_group_profile()["address"]
 
+    def on_group_list_selected(self, _event=None) -> None:
+        if self._busy:
+            current = self.chat.get()
+            # 任务进行中若直接 selection_set，会再次触发本事件，陷入死循环并卡死窗口。
+            if current and self.group_list.exists(current) and self.group_list.selection() != (current,):
+                self.group_list.selection_set(current)
+            return
+        selection = self.group_list.selection()
+        if not selection:
+            return
+        self.chat.set(selection[0])
+        self.on_group_selected()
+
     def on_group_selected(self, _event=None) -> None:
         selected = self.chat.get()
         self._set_log_group(selected or "系统")
@@ -1697,6 +1893,22 @@ class TelegramDownloaderApp:
         self.update_retry_button()
         self.update_first_capture_status()
         _write_group_settings(self.program_root, self.settings)
+
+    def refresh_group_colors(self) -> None:
+        names = [item["name"] for item in self.settings.get("groups", [])]
+        if not names:
+            return
+        captured: set[str] = set()
+        try:
+            output = Path(self.output_path.get().strip().strip('"')).expanduser()
+            target_day = parse_day(self.day.get())
+        except (OSError, ValueError):
+            pass
+        else:
+            captured = {name for name in names if today_result_exists(output, target_day, name)}
+        for name in names:
+            if self.group_list.exists(name):
+                self.group_list.item(name, tags=("captured",) if name in captured else ())
 
     def update_first_capture_status(self) -> bool:
         group_name = self.chat.get().strip()
@@ -1712,14 +1924,11 @@ class TelegramDownloaderApp:
         self.first_capture_status_label.configure(
             style="FirstCaptureDone.TLabel" if captured else "FirstCapturePending.TLabel"
         )
+        self.refresh_group_colors()
         return captured
 
     def update_retry_button(self) -> None:
-        if self.chat.get():
-            if not self.retry_button.winfo_manager():
-                self.retry_button.pack(side="left", padx=(0, 8))
-        else:
-            self.retry_button.pack_forget()
+        self.retry_button.configure(state="normal" if self.chat.get() else "disabled")
 
     def open_group_settings(self) -> None:
         GroupSettingsDialog(self)
@@ -1774,7 +1983,10 @@ class TelegramDownloaderApp:
                     save_selected_account(self.app_data, account_id)
             except (OSError, ValueError):
                 self.selected_account_id = ""
-                messagebox.showwarning("账号配置不可用", "无法读取登录配置或保存默认账号，本次选择未生效；原文件和会话均已保留。")
+                if self._workflow_mode:
+                    self._workflow_fail("无法读取默认账号配置；原文件和会话均已保留")
+                else:
+                    messagebox.showwarning("账号配置不可用", "无法读取登录配置或保存默认账号，本次选择未生效；原文件和会话均已保留。")
             else:
                 self.api_id.set(str(api_id))
                 self.api_hash.set(api_hash)
@@ -1828,7 +2040,7 @@ class TelegramDownloaderApp:
             return
         existing = getattr(self, "login_settings_window", None)
         if existing is not None and existing.winfo_exists():
-            self._center_dialog(existing, 760, 570)
+            self._center_dialog(existing, 760, 640)
             existing.lift()
             existing.focus_force()
             return
@@ -1879,6 +2091,20 @@ class TelegramDownloaderApp:
         ttk.Label(status, text="当前状态", style="Hint.TLabel").pack(side="left")
         ttk.Label(status, textvariable=self.account_status, wraplength=500).pack(side="right")
 
+        display = ttk.Frame(frame, style="Dark.TFrame")
+        display.pack(fill="x", pady=(0, 14))
+        ttk.Label(display, text="窗口分辨率", style="Hint.TLabel").pack(side="left")
+        self._preset_buttons = {}
+        for preset in ("2k", "1080"):
+            button = ttk.Button(
+                display, text=preset.upper(), style="Preset.TButton",
+                command=lambda value=preset: self.choose_window_preset(value),
+            )
+            button.pack(side="left", padx=(10, 0))
+            self._preset_buttons[preset] = button
+        ttk.Label(display, text="切换后自动重启生效", style="Hint.TLabel").pack(side="left", padx=(12, 0))
+        self._refresh_preset_buttons()
+
         buttons = ttk.Frame(frame, style="Dark.TFrame")
         buttons.pack(fill="x")
         self.login_submit_button = ttk.Button(
@@ -1890,7 +2116,7 @@ class TelegramDownloaderApp:
         if self.refresh_account_profiles() and not self.account_profiles:
             self.begin_add_account()
         self._update_account_form()
-        self._center_dialog(window, 760, 570)
+        self._center_dialog(window, 760, 640)
         window.bind("<Escape>", lambda _event: self.close_login_settings())
         window.lift()
         self.account_combo.focus_set()
@@ -1903,7 +2129,7 @@ class TelegramDownloaderApp:
         path = group_notes_path(self.program_root, self.chat.get())
         if not path.exists():
             write_notes_config(path, [])
-        os.startfile(path)
+        self._open_with_shell(path)
 
     def choose_output(self) -> None:
         selected = filedialog.askdirectory(title="选择保存目录")
@@ -1924,7 +2150,65 @@ class TelegramDownloaderApp:
         if not path.is_dir():
             messagebox.showinfo("结果目录不存在", "当前群和日期还没有抓取结果。")
             return
-        os.startfile(path)
+        self._open_with_shell(path)
+
+    def open_capture_status(self) -> None:
+        group_name = self.chat.get().strip()
+        if not group_name:
+            messagebox.showwarning("尚未配置", "请先点击“群组设置”添加群配置")
+            return
+        path = capture_status_path(self.status_root, group_name)
+        if not path.exists():
+            messagebox.showinfo("暂无抓取状态", f"该群还没有抓取状态记录：\n{path}")
+            return
+        self._open_with_shell(path)
+
+    def _initial_window_preset(self) -> str:
+        preset = load_window_preset(self.app_data)
+        if preset:
+            return preset
+        return "2k" if self.root.winfo_screenwidth() >= 2000 else "1080"
+
+    def _window_size_for_preset(self, preset: str) -> tuple[int, int]:
+        width, height = WINDOW_PRESETS.get(preset, WINDOW_PRESETS["1080"])
+        width = min(width, max(self.root.winfo_screenwidth() - 40, 800))
+        height = min(height, max(self.root.winfo_screenheight() - 80, 600))
+        return width, height
+
+    def restart_application(self) -> None:
+        if getattr(sys, "frozen", False):
+            command = [sys.executable]
+            workdir = Path(sys.executable).resolve().parent
+        else:
+            command = [sys.executable, str(Path(__file__).resolve())]
+            workdir = Path(__file__).resolve().parent
+        subprocess.Popen(command, cwd=str(workdir))
+        self.root.destroy()
+
+    def choose_window_preset(self, preset: str) -> None:
+        if preset not in WINDOW_PRESETS:
+            return
+        if self._busy:
+            messagebox.showwarning("任务进行中", "请等当前任务结束后再切换窗口分辨率")
+            return
+        if preset == self.window_preset:
+            messagebox.showinfo("提示", f"当前窗口已经是 {preset.upper()} 预设")
+            return
+        try:
+            save_window_preset(self.app_data, preset)
+        except (OSError, ValueError) as exc:
+            messagebox.showwarning("无法保存", str(exc))
+            return
+        messagebox.showinfo("已保存", "窗口分辨率已保存，软件将自动重启生效")
+        self.restart_application()
+
+    def _refresh_preset_buttons(self) -> None:
+        for preset, button in getattr(self, "_preset_buttons", {}).items():
+            if button.winfo_exists():
+                button.configure(
+                    style="PresetActive.TButton" if preset == self.window_preset else "Preset.TButton",
+                    text=preset.upper(),
+                )
 
     def clear_output(self) -> None:
         path = Path(self.output_path.get().strip().strip('"')).expanduser().resolve()
@@ -2053,18 +2337,28 @@ class TelegramDownloaderApp:
         self.root.after(0, clear_view)
         self._schedule_log_rollover()
 
-    def log(self, text: str) -> None:
-        if not text.startswith("【"):
-            text = "【系统】" + text
-        try:
-            with self._log_lock:
+    def _append_log_file(self, text: str) -> None:
+        with self._log_lock:
+            try:
                 now = datetime.now(CN_TZ)
                 path = self._rotate_runtime_log(now.date())
                 stamp = now.strftime("[%H:%M:%S] ")
                 with path.open("a", encoding="utf-8") as handle:
                     handle.write(stamp + text + "\n")
-        except OSError:
-            pass
+            except OSError:
+                pass
+            try:
+                if self._workflow_log_path is not None:
+                    self._workflow_log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with self._workflow_log_path.open("a", encoding="utf-8") as handle:
+                        handle.write(text + "\n")
+            except OSError:
+                pass
+
+    def log(self, text: str) -> None:
+        if not text.startswith("【"):
+            text = "【系统】" + text
+        self._append_log_file(text)
 
         def append() -> None:
             self.log_box.configure(state="normal")
@@ -2072,7 +2366,7 @@ class TelegramDownloaderApp:
             self.log_box.see("end")
             self.log_box.configure(state="disabled")
 
-        self.root.after(0, append)
+        self._post_to_main(append)
 
     def set_busy(self, busy: bool, status: str = "") -> None:
         if not busy:
@@ -2098,7 +2392,118 @@ class TelegramDownloaderApp:
 
     def _on_capture_window_destroyed(self, event) -> None:
         if event.widget is self.root:
+            self._watchdog_stop.set()
             self._stop_capture_progress()
+            if self._ui_pump_id is not None:
+                try:
+                    self.root.after_cancel(self._ui_pump_id)
+                except TclError:
+                    pass
+                self._ui_pump_id = None
+
+    def _post_to_main(self, callback) -> None:
+        """Deliver UI work from worker threads without touching Tk off the main thread."""
+        if threading.current_thread() is threading.main_thread():
+            self.root.after(0, callback)
+        else:
+            self._ui_queue.put(callback)
+
+    def _start_freeze_watchdog(self) -> None:
+        """Record what the UI thread was doing when Windows declares it unresponsive."""
+        self._ui_heartbeat = time.monotonic()
+
+        def watch() -> None:
+            reported_at = 0.0
+            while not self._watchdog_stop.wait(UI_HEARTBEAT_SECONDS):
+                stalled = time.monotonic() - self._ui_heartbeat
+                if stalled < UI_FREEZE_SECONDS:
+                    reported_at = 0.0
+                    continue
+                if reported_at and stalled - reported_at < UI_FREEZE_DUMP_COOLDOWN:
+                    continue
+                reported_at = stalled
+                self._freeze_dump(stalled)
+
+        threading.Thread(target=watch, name="ui-freeze-watchdog", daemon=True).start()
+
+    def _freeze_dump(self, stalled: float) -> None:
+        self._append_log_file(f"【诊断】界面线程无响应 {stalled:.0f} 秒，线程堆栈：\n{thread_stack_dump()}")
+        self.log(f"【诊断】界面线程曾无响应 {stalled:.0f} 秒，堆栈已写入运行日志")
+
+    def _open_with_shell(self, target, failure_title: str = "打开失败") -> None:
+        """ShellExecute can wait on a busy Shell, so never call it on the UI thread."""
+        def worker() -> None:
+            try:
+                os.startfile(target)
+            except OSError as exc:
+                text = str(exc) or "无法打开该文件或目录"
+                self._post_to_main(lambda message=text: messagebox.showerror(failure_title, message))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pump_ui_callbacks(self) -> None:
+        self._ui_heartbeat = time.monotonic()
+        if self._ui_pump_id is not None:
+            try:
+                self.root.after_cancel(self._ui_pump_id)
+            except TclError:
+                pass
+            self._ui_pump_id = None
+        try:
+            while True:
+                callback = self._ui_queue.get_nowait()
+                try:
+                    callback()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        try:
+            self._ui_pump_id = self.root.after(100, self._pump_ui_callbacks)
+        except TclError:
+            self._ui_pump_id = None
+
+    def _workflow_fail(self, detail: str) -> None:
+        if self._workflow_exit_code is not None:
+            return
+        self._workflow_exit_code = 1
+        self.log(f"【工作流】失败：{detail}")
+        self.root.after(0, self.root.destroy)
+
+    def _workflow_finish(self, code: int) -> None:
+        if self._workflow_exit_code is not None:
+            return
+        self._workflow_exit_code = code
+        self.log("【工作流】单群抓取完成" if code == 0 else "【工作流】单群抓取失败")
+        self.root.after(0, self.root.destroy)
+
+    def run_workflow_group(self, group_name: str) -> None:
+        """Run one configured group without opening dialogs; used by scheduled jobs."""
+        self._workflow_mode = True
+        self._workflow_group = group_name.strip()
+        if not self._workflow_group:
+            self._workflow_fail("群名不能为空")
+            return
+        names = {item["name"] for item in self.settings.get("groups", [])}
+        if self._workflow_group not in names:
+            self._workflow_fail(f"未找到群配置：{self._workflow_group}")
+            return
+        try:
+            self.reload_group_profiles(self._workflow_group)
+            account_id = load_selected_account(self.app_data)
+            if not account_id:
+                raise ValueError("未找到默认账号，请先在 GUI 中选择并登录账号")
+            self.select_account(account_id, remember=False)
+            if self.selected_account_id != account_id:
+                raise ValueError("默认账号配置不可用")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._workflow_fail(str(exc))
+            return
+        self.login(automatic=True, on_failure=self._workflow_fail)
+
+    def _workflow_start_capture(self) -> None:
+        if self._workflow_exit_code is None and self._workflow_mode:
+            self.start_download()
 
     def _stop_capture_progress(self) -> None:
         self._capture_generation += 1
@@ -2106,15 +2511,33 @@ class TelegramDownloaderApp:
         if self._capture_timer is not None:
             self.root.after_cancel(self._capture_timer)
             self._capture_timer = None
+        try:
+            self.progress_bar.configure(value=0)
+            self.progress_summary.set("")
+        except (AttributeError, TclError):
+            pass
+
+    def _show_progress_bar(self, current: int, total: int) -> None:
+        try:
+            if total > 0 and current > 0:
+                self.progress_bar.configure(value=min(100, current * 100 / total))
+                self.progress_summary.set(f"{current} / {total}")
+            else:
+                self.progress_bar.configure(value=0)
+                self.progress_summary.set("")
+        except TclError:
+            pass
 
     def _render_capture_progress(self) -> None:
         current, total, status, phase_started = self._capture_progress
         now = time.monotonic()
+        effective = current if phase_started is not None else 0
         self.task_status.set(format_processing_status(
-            current if phase_started is not None else 0, total,
+            effective, total,
             max(0, now - phase_started) if phase_started is not None else 0,
             status=status, total_elapsed=now - self._capture_started,
         ))
+        self._show_progress_bar(effective, total)
 
     def _tick_capture_progress(self) -> None:
         self._capture_timer = None
@@ -2135,9 +2558,9 @@ class TelegramDownloaderApp:
                 self._capture_progress = (current, total, status, phase_started)
                 self._render_capture_progress()
 
-        self.root.after(0, update)
+        self._post_to_main(update)
 
-    def run_worker(self, operation, on_success) -> None:
+    def run_worker(self, operation, on_success, on_failure=None) -> None:
         if self._busy:
             return
         self.set_busy(True, "准备中…")
@@ -2152,8 +2575,13 @@ class TelegramDownloaderApp:
                 self.log(f"【错误】任务中止：{type(exc).__name__}: {exc}")
                 def fail(text=error_text) -> None:
                     self.set_busy(False, "操作失败")
-                    messagebox.showerror("操作失败", text)
-                self.root.after(0, fail)
+                    if not self._workflow_mode:
+                        messagebox.showerror("操作失败", text)
+                    if on_failure is not None:
+                        on_failure(text) if self._workflow_mode else on_failure()
+                    elif self._workflow_mode:
+                        self._workflow_fail(text)
+                self._post_to_main(fail)
                 return
             finally:
                 loop.close()
@@ -2163,7 +2591,7 @@ class TelegramDownloaderApp:
                     on_success(result)
                 finally:
                     self.set_busy(False)
-            self.root.after(0, finish)
+            self._post_to_main(finish)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2183,15 +2611,19 @@ class TelegramDownloaderApp:
             answer["value"] = simpledialog.askstring(title, prompt, parent=self.root, show="●" if masked else None)
             event.set()
 
-        self.root.after(0, show_dialog)
+        self._post_to_main(show_dialog)
         event.wait()
         value = answer["value"]
         if not value:
             raise RuntimeError("登录已取消")
         return value.strip()
 
-    def login(self, *, automatic: bool = False) -> None:
-        if self._busy or self._account_load_error:
+    def login(self, *, automatic: bool = False, on_failure=None) -> None:
+        if self._busy:
+            return
+        if self._account_load_error:
+            if self._workflow_mode:
+                self._workflow_fail("账号列表读取失败，无法恢复默认账号")
             return
         try:
             if not self.adding_account and not self.selected_account_id:
@@ -2219,7 +2651,10 @@ class TelegramDownloaderApp:
             else:
                 save_selected_account(self.app_data, profile["id"])
         except (OSError, ValueError) as exc:
-            messagebox.showwarning("信息不完整", str(exc))
+            if self._workflow_mode:
+                self._workflow_fail(str(exc))
+            else:
+                messagebox.showwarning("信息不完整", str(exc))
             return
         self._clear_login_state()
         self._set_log_group("系统")
@@ -2270,6 +2705,7 @@ class TelegramDownloaderApp:
                 raise RuntimeError(f"账号登录未完成：{detail}") from None
 
         def success(result: tuple[str, int]) -> None:
+            self._login_token = ""
             account_name, user_id = result
             self.refresh_account_profiles()
             self.logged_in = True
@@ -2281,10 +2717,29 @@ class TelegramDownloaderApp:
             window = getattr(self, "login_settings_window", None)
             if window is not None and window.winfo_exists():
                 window.destroy()
-            if not automatic:
+            if self._workflow_mode:
+                self.root.after(0, self._workflow_start_capture)
+            elif not automatic:
                 messagebox.showinfo("登录成功", f"当前账号：{name}（{account_name}）")
 
-        self.run_worker(operation, success)
+        self._login_token = uuid4().hex
+        token = self._login_token
+        self.root.after(60000, lambda: self._login_watchdog(token))
+        failure_callback = on_failure or (self._workflow_fail if self._workflow_mode else self.open_login_settings)
+        self.run_worker(operation, success, on_failure=failure_callback)
+
+    def _login_watchdog(self, token: str) -> None:
+        if token != self._login_token:
+            return
+        self._login_token = ""
+        if not self._busy:
+            return
+        self.log("【账号】登录超时未返回（网络异常），已恢复界面；请重试")
+        self.set_busy(False, "登录超时：网络异常，请重试")
+        if self._workflow_mode:
+            self._workflow_fail("登录超时：网络异常")
+        else:
+            self.open_login_settings()
 
     def validate_task(self) -> tuple[Path, Path, date, clock_time, clock_time, str, dict]:
         group_name = self.chat.get().strip()
@@ -2316,7 +2771,10 @@ class TelegramDownloaderApp:
                 group_name,
                 group_profile,
             ) = self.validate_task()
-            notes = notes_override if notes_override is not None else load_notes(notes_file, allow_empty=True)
+            if notes_override is not None:
+                default_notes, address_notes = dict(notes_override), {}
+            else:
+                default_notes, address_notes = load_group_notes(notes_file)
             chat = group_profile["address"]
             chat_id = group_profile.get("chat_id")
             if chat_id is not None:
@@ -2334,7 +2792,10 @@ class TelegramDownloaderApp:
                     raise ValueError("私密群绑定账号的本地会话不存在，请先登录该账号后重试")
             else:
                 if not self.logged_in or not self.active_account_id or self.active_account_id != self.selected_account_id:
-                    messagebox.showwarning("尚未登录", "请先点击“选择账号 / 登录”")
+                    if self._workflow_mode:
+                        self._workflow_fail("默认账号尚未登录")
+                    else:
+                        messagebox.showwarning("尚未登录", "请先点击“选择账号 / 登录”")
                     return
                 task_account_id = self.active_account_id
                 account_profile = {"user_id": self.active_user_id}
@@ -2345,7 +2806,10 @@ class TelegramDownloaderApp:
             api_id, api_hash, account_phone = saved
             session_path = task_directory / "account"
         except (OSError, ValueError) as exc:
-            messagebox.showwarning("信息不完整", str(exc))
+            if self._workflow_mode:
+                self._workflow_fail(str(exc))
+            else:
+                messagebox.showwarning("信息不完整", str(exc))
             return
         active_account_id = self.active_account_id
         self._set_log_group(group_name)
@@ -2371,10 +2835,29 @@ class TelegramDownloaderApp:
                 or not group_output.is_dir()
             )
             incremental = bool(status_enabled and retry and not first_capture)
-            scan_notes = notes_for_retry(notes, previous_status) if incremental else notes
+            chats = split_chat_addresses(chat)
+            if chat_id is None and not chats:
+                raise ValueError("群地址不能为空，请在设置里填写至少一个 Telegram 群地址")
+            source_order = [str(chat_id)] if chat_id is not None else list(chats)
+            base_notes_by_source = {
+                address: address_notes.get(address, default_notes) for address in source_order
+            }
+            if incremental:
+                source_scan_notes = {
+                    address: notes_for_retry(notes_map, previous_status)
+                    for address, notes_map in base_notes_by_source.items()
+                }
+            else:
+                source_scan_notes = dict(base_notes_by_source)
+            all_labels = sorted({
+                label for notes_map in base_notes_by_source.values() for label in notes_map.values()
+            })
+            pending_labels = {
+                label for notes_map in source_scan_notes.values() for label in notes_map.values()
+            }
             retry_full_day = incremental and any(
                 not (previous_status or {}).get("remarks", {}).get(label, {}).get("pending_message_ids")
-                for label in set(scan_notes.values())
+                for label in pending_labels
             )
             if not retry:
                 reason = "点击正常抓取，执行全量"
@@ -2387,26 +2870,22 @@ class TelegramDownloaderApp:
             else:
                 reason = "同日状态与结果文件夹存在，执行增量复抓"
             self.log(f"【复抓】{reason}；抓取日期 {target_day}")
-            if incremental and notes:
-                pending_labels = set(scan_notes.values())
-                skipped_labels = set(notes.values()) - pending_labels
+            if incremental and all_labels:
+                skipped_labels = set(all_labels) - pending_labels
                 self.log(f"【复抓】待检查备注（{len(pending_labels)}）：{'、'.join(sorted(pending_labels)) or '无'}")
                 self.log(f"【复抓】已完成跳过（{len(skipped_labels)}）：{'、'.join(sorted(skipped_labels)) or '无'}")
-            elif not notes:
+            elif not all_labels:
                 self.log("【复抓】备注为空：抓取范围内全部图片" + ("，本次只扫描新增消息" if incremental else ""))
             start_local = datetime.combine(target_day, start_clock, CN_TZ)
             end_local = datetime.combine(target_day, end_clock, CN_TZ) + timedelta(minutes=1)
             start_utc = start_local.astimezone(timezone.utc)
             end_utc = end_local.astimezone(timezone.utc)
 
-            chats = split_chat_addresses(chat)
-            if chat_id is None and not chats:
-                raise ValueError("群地址不能为空，请在设置里填写至少一个 Telegram 群地址")
             with logged_telegram_client(str(session_path), api_id, api_hash, self.log) as client:
                 client.connect()
                 if not client.is_user_authorized():
                     if task_account_id == active_account_id:
-                        self.root.after(0, self._clear_login_state)
+                        self._post_to_main(self._clear_login_state)
                         raise RuntimeError("登录已失效，请重新登录")
                     raise RuntimeError(
                         f"绑定账号 {account_profile.get('name') or task_account_id} 的登录已失效，请重新登录该账号后重试"
@@ -2415,7 +2894,7 @@ class TelegramDownloaderApp:
                     verify_account_user(account_profile, client.get_me(), account_phone)
                 except (RuntimeError, ValueError):
                     if task_account_id == active_account_id:
-                        self.root.after(0, self._clear_login_state)
+                        self._post_to_main(self._clear_login_state)
                     raise
                 entities = []
                 if chat_id is not None:
@@ -2443,25 +2922,30 @@ class TelegramDownloaderApp:
                 self.set_progress(0, 0, "扫描中：已发现 0 张")
                 all_messages = []
                 media_messages = []
-                seen_ids: set[int] = set()
+                source_messages: dict[str, list] = {address: [] for address in source_order}
+                source_media: dict[str, list] = {address: [] for address in source_order}
+                seen_keys: set[tuple[str, int]] = set()
                 message_sources: dict[int, str] = {}
 
                 def add_message(message, require_new: bool = False, min_id: int = 0) -> None:
                     if message is None:
                         return
-                    if getattr(message, "id", None) in seen_ids:
+                    key = (chat_address, getattr(message, "id", None))
+                    if key in seen_keys:
                         self.log(f"【扫描】来源 {chat_address} 消息 {message.id}：重复消息ID，按现有去重规则跳过")
                         return
                     if require_new and message.id <= min_id:
                         return
                     if message.date < start_utc or message.date >= end_utc:
                         return
-                    seen_ids.add(message.id)
+                    seen_keys.add(key)
                     all_messages.append(message)
+                    source_messages[chat_address].append(message)
                     message_sources[id(message)] = chat_address
                     mime = (message.file.mime_type if getattr(message, "file", None) else "") or ""
                     if getattr(message, "photo", None) or mime.startswith("image/"):
                         media_messages.append(message)
+                        source_media[chat_address].append(message)
                     if len(all_messages) % 50 == 0:
                         self.set_progress(len(media_messages), 0, f"扫描中：已发现 {len(media_messages)} 张")
                     if len(all_messages) % 200 == 0:
@@ -2494,7 +2978,7 @@ class TelegramDownloaderApp:
                             if message.date < start_utc:
                                 break
                             add_message(message)
-                            if message is not None and getattr(message, "id", None) in seen_ids:
+                            if message is not None and (chat_address, getattr(message, "id", None)) in seen_keys:
                                 source_ids.append(message.id)
                     elif incremental:
                         if pending_ids:
@@ -2506,7 +2990,7 @@ class TelegramDownloaderApp:
                                 pending_messages = [pending_messages]
                             for message in pending_messages:
                                 add_message(message)
-                                if message is not None and getattr(message, "id", None) in seen_ids:
+                                if message is not None and (chat_address, getattr(message, "id", None)) in seen_keys:
                                     source_ids.append(message.id)
                         try:
                             iterator = client.iter_messages(entity, min_id=source_last_id, offset_date=end_utc)
@@ -2516,14 +3000,14 @@ class TelegramDownloaderApp:
                             if message.date < start_utc:
                                 break
                             add_message(message, require_new=True, min_id=source_last_id)
-                            if message is not None and getattr(message, "id", None) in seen_ids:
+                            if message is not None and (chat_address, getattr(message, "id", None)) in seen_keys:
                                 source_ids.append(message.id)
                     else:
                         for message in client.iter_messages(entity, offset_date=end_utc):
                             if message.date < start_utc:
                                 break
                             add_message(message)
-                            if message is not None and getattr(message, "id", None) in seen_ids:
+                            if message is not None and (chat_address, getattr(message, "id", None)) in seen_keys:
                                 source_ids.append(message.id)
                     current_last_ids[chat_address] = max([source_last_id, *source_ids], default=source_last_id)
                     self.log(f"【扫描】结束链接 {source_index}/{len(entities)}：{chat_address}；"
@@ -2533,174 +3017,243 @@ class TelegramDownloaderApp:
                 scanned = len(all_messages)
                 self.set_progress(len(media_messages), 0, f"备注匹配：共 {len(media_messages)} 张图片")
 
-                adjacent_labels = set()
-                visual_adjacent_labels = set()
-                first_image_ocr_labels = set()
-                first_image_detected_labels = None
-                bidirectional_labels = set()
-                exact_labels = set()
-                if group_name == SPECIAL_RETRY_GROUP:
-                    adjacent_labels.update(YANRAN_ADJACENT_LABELS.intersection(scan_notes.values()))
-                    visual_adjacent_labels.update(
-                        adjacent_labels - YANRAN_FIRST_IMAGE_OCR_LABELS
-                    )
-                    first_image_ocr_labels.update(
-                        YANRAN_FIRST_IMAGE_OCR_LABELS.intersection(scan_notes.values())
-                    )
-                    bidirectional_labels.update(adjacent_labels)
-                if group_name == HUANGDAXIAN_GROUP:
-                    adjacent_labels.update(HUANGDAXIAN_ADJACENT_LABELS.intersection(scan_notes.values()))
-                    first_image_ocr_labels.update(adjacent_labels)
-                    first_image_detected_labels = HUANGDAXIAN_OCR_LABELS.intersection(scan_notes.values())
-                    bidirectional_labels.update(adjacent_labels)
-                    if "战狼" in adjacent_labels:
-                        exact_labels.add("战狼")
-                if group_name == MUXI_GROUP:
-                    exact_labels.update(MUXI_EXACT_LABELS.intersection(scan_notes.values()))
-                marker_filter_labels = set()
-                if group_name == XINAO_EXPERT_GROUP:
-                    marker_filter_labels.update(XINAO_EXPERT_FILTER_LABELS.intersection(scan_notes.values()))
-                selection = (
-                    {}
-                    if incremental and notes and not scan_notes
-                    else build_download_selection(
-                        media_messages,
-                        scan_notes,
-                        special_adjacent_labels=adjacent_labels,
-                        bidirectional_adjacent_labels=bidirectional_labels,
-                        exact_labels=exact_labels,
-                        similarity_labels=visual_adjacent_labels,
-                        log=self.log,
-                    )
-                )
-                preview_cache: dict[int, bytes] = {}
+                source_selections: dict[str, dict[int, set[str]]] = {}
+                source_preview_caches: dict[str, dict[int, bytes]] = {}
+                source_exact_labels: dict[str, set[str]] = {}
                 ignored_note_ids: dict[str, set[int]] = defaultdict(set)
-                if visual_adjacent_labels or first_image_ocr_labels or marker_filter_labels:
-                    groups = ordered_media_groups(media_messages)
-                    preview_ids: set[int] = set()
-                    first_image_preview_ids: set[int] = set()
-                    marker_preview_ids: set[int] = set()
-                    if visual_adjacent_labels:
-                        preview_ids.update(
-                            collect_adjacent_preview_messages(
-                                media_messages,
-                                selection,
-                                visual_adjacent_labels,
-                                bidirectional_labels,
-                            )
+
+                def prepare_source(chat_address: str) -> tuple[dict[int, set[str]], dict[int, bytes]]:
+                    source_media_messages = source_media.get(chat_address, [])
+                    source_notes = source_scan_notes.get(chat_address, {})
+                    source_base_notes = base_notes_by_source.get(chat_address, {})
+                    adjacent_labels = set()
+                    visual_adjacent_labels = set()
+                    first_image_ocr_labels = set()
+                    first_image_detected_labels = None
+                    bidirectional_labels = set()
+                    exact_labels = set()
+                    if group_name == SPECIAL_RETRY_GROUP:
+                        adjacent_labels.update(YANRAN_ADJACENT_LABELS.intersection(source_notes.values()))
+                        visual_adjacent_labels.update(
+                            adjacent_labels - YANRAN_FIRST_IMAGE_OCR_LABELS
                         )
-                    if first_image_ocr_labels:
-                        first_image_preview_ids = collect_adjacent_first_preview_messages(
-                            media_messages,
-                            selection,
-                            first_image_ocr_labels,
-                            bidirectional_labels,
+                        first_image_ocr_labels.update(
+                            YANRAN_FIRST_IMAGE_OCR_LABELS.intersection(source_notes.values())
                         )
-                        preview_ids.update(first_image_preview_ids)
-                    if marker_filter_labels:
-                        marker_preview_ids = collect_label_group_messages(media_messages, selection, marker_filter_labels)
-                        preview_ids.update(marker_preview_ids)
-                    ocr_engine = None
-                    if first_image_preview_ids or marker_preview_ids:
-                        self.set_progress(0, 0, "加载 GPU OCR 模型…")
-                        ocr_engine = get_ocr_engine()
-                        self.log(
-                            f"【识别】OCR 配置：GPU-only / {OCR_DEVICE} / FP32 / "
-                            f"{OCR_MODEL_DET} + {OCR_MODEL_REC}"
-                        )
-                    preview_messages = {
-                        message.id: message for message in media_messages if message.id in preview_ids
-                    }
-                    preview_started = time.monotonic()
-                    preview_done = 0
-                    preview_total = len(preview_messages)
-                    self.set_progress(0, preview_total, f"预览下载：0 / {preview_total}", phase_started=preview_started)
-
-                    async def load_similarity_previews() -> None:
-                        semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
-
-                        async def load_preview(message) -> None:
-                            nonlocal preview_done
-                            async with semaphore:
-                                try:
-                                    payload = await message.download_media(file=bytes)
-                                    if isinstance(payload, bytes):
-                                        preview_cache[message.id] = payload
-                                except Exception as exc:
-                                    self.log(f"【识别】预览下载失败：来源 {message_sources.get(id(message))} 消息 {message.id}（{type(exc).__name__}: {exc}）")
-                                finally:
-                                    preview_done += 1
-                                    self.set_progress(preview_done, preview_total,
-                                                      f"预览下载：{preview_done} / {preview_total}", phase_started=preview_started)
-
-                        await asyncio.gather(*(load_preview(message) for message in preview_messages.values()))
-
-                    preview_loop = getattr(client, "loop", None)
-                    owns_preview_loop = preview_loop is None
-                    if owns_preview_loop:
-                        preview_loop = asyncio.new_event_loop()
-                    try:
-                        preview_loop.run_until_complete(load_similarity_previews())
-                    finally:
-                        if owns_preview_loop:
-                            preview_loop.close()
-
-                    if visual_adjacent_labels or first_image_ocr_labels:
-                        self.set_progress(0, 0, f"图片比对：共 {len(groups)} 组")
-                        selection = build_download_selection(
-                            media_messages,
-                            scan_notes,
+                        bidirectional_labels.update(adjacent_labels)
+                    if group_name == HUANGDAXIAN_GROUP:
+                        adjacent_labels.update(HUANGDAXIAN_ADJACENT_LABELS.intersection(source_notes.values()))
+                        first_image_ocr_labels.update(adjacent_labels)
+                        first_image_detected_labels = HUANGDAXIAN_OCR_LABELS.intersection(source_notes.values())
+                        bidirectional_labels.update(adjacent_labels)
+                        if "战狼" in adjacent_labels:
+                            exact_labels.add("战狼")
+                    if group_name == MUXI_GROUP:
+                        exact_labels.update(MUXI_EXACT_LABELS.intersection(source_notes.values()))
+                    marker_filter_labels = set()
+                    if group_name == XINAO_EXPERT_GROUP:
+                        marker_filter_labels.update(XINAO_EXPERT_FILTER_LABELS.intersection(source_notes.values()))
+                    source_exact_labels[chat_address] = set(exact_labels)
+                    selection = (
+                        {}
+                        if incremental and source_base_notes and not source_notes
+                        else build_download_selection(
+                            source_media_messages,
+                            source_notes,
                             special_adjacent_labels=adjacent_labels,
                             bidirectional_adjacent_labels=bidirectional_labels,
                             exact_labels=exact_labels,
                             similarity_labels=visual_adjacent_labels,
-                            group_similarity=lambda anchor, candidate: image_groups_are_similar(
-                                [preview_cache[message.id] for message in anchor if message.id in preview_cache],
-                                [preview_cache[message.id] for message in candidate if message.id in preview_cache],
-                            ),
                             log=self.log,
                         )
-                    if first_image_ocr_labels and first_image_preview_ids:
-                        ocr_started = time.monotonic()
-                        first_ocr_total = len(first_image_preview_ids)
-                        self.set_progress(
-                            0, first_ocr_total,
-                            f"文字识别：0 / {first_ocr_total}",
-                            phase_started=ocr_started,
-                        )
-                        selection = add_first_image_ocr_immediate_groups(
-                            media_messages,
-                            selection,
-                            first_image_ocr_labels,
-                            preview_cache,
-                            ocr_engine=ocr_engine,
-                            bidirectional_labels=bidirectional_labels,
-                            detected_labels=first_image_detected_labels,
-                            log=self.log,
-                            on_progress=lambda done, total: self.set_progress(
-                                done, total, f"文字识别：{done} / {total}",
+                    )
+                    preview_cache: dict[int, bytes] = {}
+                    if visual_adjacent_labels or first_image_ocr_labels or marker_filter_labels:
+                        groups = ordered_media_groups(source_media_messages)
+                        preview_ids: set[int] = set()
+                        first_image_preview_ids: set[int] = set()
+                        marker_preview_ids: set[int] = set()
+                        if visual_adjacent_labels:
+                            preview_ids.update(
+                                collect_adjacent_preview_messages(
+                                    source_media_messages,
+                                    selection,
+                                    visual_adjacent_labels,
+                                    bidirectional_labels,
+                                )
+                            )
+                        if first_image_ocr_labels:
+                            first_image_preview_ids = collect_adjacent_first_preview_messages(
+                                source_media_messages,
+                                selection,
+                                first_image_ocr_labels,
+                                bidirectional_labels,
+                            )
+                            preview_ids.update(first_image_preview_ids)
+                        if marker_filter_labels:
+                            marker_preview_ids = collect_label_group_messages(
+                                source_media_messages, selection, marker_filter_labels
+                            )
+                            preview_ids.update(marker_preview_ids)
+                        ocr_engine = None
+                        if first_image_preview_ids or marker_preview_ids:
+                            self.set_progress(0, 0, "加载 GPU OCR 模型…")
+                            ocr_engine = get_ocr_engine()
+                            self.log(
+                                f"【识别】OCR 配置：GPU-only / {OCR_DEVICE} / FP32 / "
+                                f"{OCR_MODEL_DET} + {OCR_MODEL_REC}"
+                            )
+                        preview_messages = {
+                            message.id: message for message in source_media_messages if message.id in preview_ids
+                        }
+                        preview_started = time.monotonic()
+                        preview_done = 0
+                        preview_total = len(preview_messages)
+                        self.set_progress(0, preview_total, f"预览下载：0 / {preview_total}", phase_started=preview_started)
+
+                        async def load_similarity_previews() -> None:
+                            semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
+                            async def load_preview(message) -> None:
+                                nonlocal preview_done
+                                async with semaphore:
+                                    try:
+                                        payload = await message.download_media(file=bytes)
+                                        if isinstance(payload, bytes):
+                                            preview_cache[message.id] = payload
+                                    except Exception as exc:
+                                        self.log(f"【识别】预览下载失败：来源 {message_sources.get(id(message))} 消息 {message.id}（{type(exc).__name__}: {exc}）")
+                                    finally:
+                                        preview_done += 1
+                                        self.set_progress(preview_done, preview_total,
+                                                          f"预览下载：{preview_done} / {preview_total}", phase_started=preview_started)
+
+                            await asyncio.gather(*(load_preview(message) for message in preview_messages.values()))
+
+                        def download_previews() -> None:
+                            preview_loop = getattr(client, "loop", None)
+                            owns_preview_loop = preview_loop is None
+                            if owns_preview_loop:
+                                preview_loop = asyncio.new_event_loop()
+                            try:
+                                preview_loop.run_until_complete(load_similarity_previews())
+                            finally:
+                                if owns_preview_loop:
+                                    preview_loop.close()
+
+                        download_previews()
+
+                        def tianji_similarity(anchor, candidate) -> bool:
+                            nonlocal preview_messages, preview_started, preview_done, preview_total
+                            required = [*anchor, *candidate]
+                            preview_messages = {message.id: message for message in required
+                                                if message.id not in preview_cache}
+                            if preview_messages:
+                                preview_started = time.monotonic()
+                                preview_done = 0
+                                preview_total = len(preview_messages)
+                                self.set_progress(0, preview_total, f"相似度补图：0 / {preview_total}",
+                                                  phase_started=preview_started)
+                                download_previews()
+                            missing = [message.id for message in required if not preview_cache.get(message.id)]
+                            if missing:
+                                raise OcrError(f"天机阁相似度检查图片缺失：{missing}；本次任务已中止")
+                            return image_groups_are_similar(
+                                [preview_cache[message.id] for message in anchor],
+                                [preview_cache[message.id] for message in candidate],
+                                min_intersection=TIANJI_MIN_COLOR_INTERSECTION,
+                                max_aspect_ratio=TIANJI_MAX_ASPECT_RATIO,
+                            )
+
+                        if visual_adjacent_labels or first_image_ocr_labels:
+                            self.set_progress(0, 0, f"图片比对：共 {len(groups)} 组")
+                            selection = build_download_selection(
+                                source_media_messages,
+                                source_notes,
+                                special_adjacent_labels=adjacent_labels,
+                                bidirectional_adjacent_labels=bidirectional_labels,
+                                exact_labels=exact_labels,
+                                similarity_labels=visual_adjacent_labels,
+                                group_similarity=lambda anchor, candidate: image_groups_are_similar(
+                                    [preview_cache[message.id] for message in anchor if message.id in preview_cache],
+                                    [preview_cache[message.id] for message in candidate if message.id in preview_cache],
+                                ),
+                                log=self.log,
+                            )
+                        checked_pairs: set[tuple[int, int]] = set()
+                        first_ocr_cache: dict = {}
+                        while first_image_ocr_labels and first_image_preview_ids:
+                            ocr_started = time.monotonic()
+                            first_ocr_total = len(first_image_preview_ids)
+                            self.set_progress(
+                                0, first_ocr_total,
+                                f"文字识别：0 / {first_ocr_total}",
                                 phase_started=ocr_started,
-                            ),
-                        )
-                    if marker_filter_labels and marker_preview_ids:
-                        self.set_progress(0, 0, "标题识别：检查不要组特征词…")
-                        marker_started = time.monotonic()
-                        selection, ignored_ids = filter_unwanted_ocr_groups(
-                            media_messages,
-                            selection,
-                            marker_filter_labels,
-                            preview_cache,
-                            XINAO_EXPERT_UNWANTED_MARKERS,
-                            ocr_engine=ocr_engine,
-                            log=self.log,
-                            on_progress=lambda done, total: self.set_progress(
-                                done, total, f"标题识别：{done} / {total}",
-                                phase_started=marker_started,
-                            ),
-                        )
-                        for label, ids in ignored_ids.items():
-                            ignored_note_ids[label].update(ids)
-                matched_total = sum(message.id in selection for message in media_messages)
+                            )
+                            selection = add_first_image_ocr_immediate_groups(
+                                source_media_messages,
+                                selection,
+                                first_image_ocr_labels,
+                                preview_cache,
+                                ocr_engine=ocr_engine,
+                                bidirectional_labels=bidirectional_labels,
+                                detected_labels=first_image_detected_labels,
+                                checked_pairs=checked_pairs,
+                                ocr_cache=first_ocr_cache,
+                                group_similarity=tianji_similarity if group_name == SPECIAL_RETRY_GROUP else None,
+                                log=self.log,
+                                on_progress=lambda done, total: self.set_progress(
+                                    done, total, f"文字识别：{done} / {total}",
+                                    phase_started=ocr_started,
+                                ),
+                            )
+                            if group_name != SPECIAL_RETRY_GROUP:
+                                break
+                            # Track edges: a rejected group may still match a different adjacent anchor.
+                            first_image_preview_ids = collect_adjacent_first_preview_messages(
+                                source_media_messages, selection, first_image_ocr_labels, bidirectional_labels,
+                                checked_pairs=checked_pairs,
+                            )
+                            preview_messages = {
+                                message.id: message for message in source_media_messages
+                                if message.id in first_image_preview_ids and message.id not in preview_cache
+                            }
+                            if preview_messages:
+                                preview_started = time.monotonic()
+                                preview_done = 0
+                                preview_total = len(preview_messages)
+                                self.set_progress(0, preview_total, f"预览下载：0 / {preview_total}",
+                                                  phase_started=preview_started)
+                                download_previews()
+                        if marker_filter_labels and marker_preview_ids:
+                            self.set_progress(0, 0, "标题识别：检查不要组特征词…")
+                            marker_started = time.monotonic()
+                            selection, ignored_ids = filter_unwanted_ocr_groups(
+                                source_media_messages,
+                                selection,
+                                marker_filter_labels,
+                                preview_cache,
+                                XINAO_EXPERT_UNWANTED_MARKERS,
+                                ocr_engine=ocr_engine,
+                                log=self.log,
+                                on_progress=lambda done, total: self.set_progress(
+                                    done, total, f"标题识别：{done} / {total}",
+                                    phase_started=marker_started,
+                                ),
+                            )
+                            for label, ids in ignored_ids.items():
+                                ignored_note_ids[label].update(ids)
+                    return selection, preview_cache
+
+                matched_total = 0
+                for source_index, address in enumerate(source_order, 1):
+                    self.log(f"【识别】链接 {source_index}/{len(source_order)}：{address}")
+                    source_selection, source_cache = prepare_source(address)
+                    source_selections[address] = source_selection
+                    source_preview_caches[address] = source_cache
+                    matched_total += sum(
+                        message.id in source_selection for message in source_media.get(address, [])
+                    )
                 self.set_progress(
                     0,
                     matched_total,
@@ -2725,7 +3278,7 @@ class TelegramDownloaderApp:
                 async def download_selected() -> None:
                     semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 
-                    async def download_message(message, labels: set[str]) -> None:
+                    async def download_message(message, labels: set[str], preview_cache: dict[int, bytes]) -> None:
                         nonlocal processed
                         async with semaphore:
                             ext = message.file.ext if message.file else ".jpg"
@@ -2772,13 +3325,16 @@ class TelegramDownloaderApp:
                                 f"正在处理：{processed} / {matched_total}", phase_started=download_started,
                             )
 
-                    await asyncio.gather(
-                        *(
-                            download_message(message, selection[message.id])
-                            for message in media_messages
-                            if message.id in selection
+                    for address in source_order:
+                        source_selection = source_selections.get(address, {})
+                        source_cache = source_preview_caches.get(address, {})
+                        await asyncio.gather(
+                            *(
+                                download_message(message, source_selection[message.id], source_cache)
+                                for message in source_media.get(address, [])
+                                if message.id in source_selection
+                            )
                         )
-                    )
 
                 download_loop = getattr(client, "loop", None)
                 owns_loop = download_loop is None
@@ -2803,14 +3359,32 @@ class TelegramDownloaderApp:
                     writer.writerows(rows)
                 self.log(f"【状态】提取报告已{'追加' if append_report else '保存'}：{report}")
 
-                labels = list(dict.fromkeys(notes.values()))
-                note_matches = build_note_message_ids(all_messages, scan_notes, exact_labels=exact_labels)
+                labels = list(dict.fromkeys(all_labels))
+                note_matches: dict[str, set[int]] = defaultdict(set)
+                broad_exact_matches: dict[str, set[int]] = defaultdict(set)
+                for address in source_order:
+                    source_notes_map = source_scan_notes.get(address, {})
+                    source_exact = source_exact_labels.get(address, set())
+                    source_all = source_messages.get(address, [])
+                    for label, ids in build_note_message_ids(
+                        source_all, source_notes_map, exact_labels=source_exact
+                    ).items():
+                        note_matches[label].update(ids)
+                    narrow_notes = {
+                        keyword: label for keyword, label in source_notes_map.items() if label in source_exact
+                    }
+                    for label, ids in build_note_message_ids(source_all, narrow_notes).items():
+                        broad_exact_matches[label].update(ids)
+                note_matches = dict(note_matches)
+                broad_exact_matches = dict(broad_exact_matches)
                 for label, ignored_message_ids in ignored_note_ids.items():
                     if label in note_matches:
                         note_matches[label] -= ignored_message_ids
-                broad_exact_matches = build_note_message_ids(
-                    all_messages, {keyword: label for keyword, label in scan_notes.items() if label in exact_labels},
-                )
+                selected_label_ids: dict[str, set[int]] = defaultdict(set)
+                for source_selection in source_selections.values():
+                    for message_id, selected_labels in source_selection.items():
+                        for label in selected_labels:
+                            selected_label_ids[label].add(message_id)
                 previous_remarks = (previous_status or {}).get("remarks", {}) if incremental else {}
                 remarks = {}
                 for label in labels:
@@ -2823,9 +3397,7 @@ class TelegramDownloaderApp:
                     # messages or failed album/OCR selections with an empty caption.
                     retired_pending = (
                         previous_pending & broad_exact_matches.get(label, set())
-                    ) - note_matches.get(label, set()) - {
-                        message_id for message_id, selected_labels in selection.items() if label in selected_labels
-                    }
+                    ) - note_matches.get(label, set()) - selected_label_ids.get(label, set())
                     if retired_pending:
                         previous_pending -= retired_pending
                         self.log(f"【状态】{label}：已重新核验并移除不符合精准备注规则的旧待抓消息 "
@@ -2898,10 +3470,13 @@ class TelegramDownloaderApp:
             )
             self.log(f"【汇总】完成：扫描 {scanned} 条，成功处理 {downloaded} 张（含已有文件），未完成备注 {unmatched} 条；"
                      f"总耗时 {format_duration(total_elapsed)}")
-            messagebox.showinfo(
-                "复抓完成" if retry else "提取完成",
-                f"扫描消息：{scanned}\n提取图片：{downloaded}\n未匹配备注：{unmatched}\n\n结果：{result_path}",
-            )
+            if self._workflow_mode:
+                self.root.after(0, lambda: self._workflow_finish(0))
+            else:
+                messagebox.showinfo(
+                    "复抓完成" if retry else "提取完成",
+                    f"扫描消息：{scanned}\n提取图片：{downloaded}\n未匹配备注：{unmatched}\n\n结果：{result_path}",
+                )
 
         self._start_capture_progress()
         self.run_worker(operation, success)
@@ -3107,7 +3682,7 @@ class GroupSettingsDialog:
         self.refresh()
 
     def open_folder(self) -> None:
-        os.startfile(group_directory(self.app.program_root))
+        self.app._open_with_shell(group_directory(self.app.program_root))
 
 
 def run_self_test() -> None:
@@ -3118,6 +3693,46 @@ def run_self_test() -> None:
 
     result = build_selection([Message(1, "前缀测试备注后缀", 9), Message(2, "", 9)], notes)
     assert result == {1: {"测试备注"}, 2: {"测试备注"}}
+
+
+def run_workflow_check(program_root: Path, group_name: str | None = None) -> int:
+    """Read-only validation for scheduled single-group runs."""
+    try:
+        settings = load_group_settings(program_root, read_only=True)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"WORKFLOW_CHECK_FAIL: 群配置不可加载：{exc}", file=sys.stderr)
+        return 1
+    groups = settings.get("groups", [])
+    wanted = groups
+    if group_name is not None:
+        wanted = [item for item in groups if item.get("name") == group_name.strip()]
+        if not wanted:
+            print(f"WORKFLOW_CHECK_FAIL: 未找到群配置：{group_name}", file=sys.stderr)
+            return 1
+    if not wanted:
+        print("WORKFLOW_CHECK_FAIL: 没有可用群配置", file=sys.stderr)
+        return 1
+
+    errors = []
+    group_root = Path(program_root) / GROUP_DIR_NAME
+    for profile in wanted:
+        name = profile["name"]
+        if profile.get("chat_id") is None and not split_chat_addresses(profile.get("address", "")):
+            errors.append(f"{name}：群地址为空")
+            continue
+        notes_path = group_root / f"{validate_group_name(name)}.json"
+        if not notes_path.is_file():
+            errors.append(f"{name}：备注 JSON 不存在")
+            continue
+        try:
+            load_group_notes(notes_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"{name}：备注 JSON 不可加载（{exc}）")
+    if errors:
+        print("WORKFLOW_CHECK_FAIL: " + "；".join(errors), file=sys.stderr)
+        return 1
+    print(f"WORKFLOW_CHECK_OK: {len(wanted)} 个群配置可加载")
+    return 0
 
 
 def run_ocr_self_test(output_file: Path) -> bool:
@@ -3169,10 +3784,14 @@ def run_ocr_self_test(output_file: Path) -> bool:
     return bool(payload["ok"])
 
 
-def main() -> None:
+def main(workflow_group: str | None = None, workflow_log: Path | None = None) -> int:
     root = Tk()
-    TelegramDownloaderApp(root)
+    app = TelegramDownloaderApp(root, show_account_dialog=workflow_group is None, workflow_log=workflow_log)
+    if workflow_group is not None:
+        root.withdraw()
+        root.after_idle(lambda: app.run_workflow_group(workflow_group))
     root.mainloop()
+    return 0 if workflow_group is None else (app._workflow_exit_code if app._workflow_exit_code is not None else 1)
 
 
 if __name__ == "__main__":
@@ -3182,5 +3801,26 @@ if __name__ == "__main__":
         raise SystemExit(0 if run_ocr_self_test(output_file) else 1)
     elif "--self-test" in sys.argv:
         run_self_test()
+    elif "--workflow-check" in sys.argv:
+        check_index = sys.argv.index("--workflow-check") + 1
+        check_group = (
+            sys.argv[check_index]
+            if check_index < len(sys.argv) and not sys.argv[check_index].startswith("--")
+            else None
+        )
+        raise SystemExit(run_workflow_check(runtime_root(), check_group))
+    elif "--workflow-group" in sys.argv:
+        workflow_index = sys.argv.index("--workflow-group") + 1
+        if workflow_index >= len(sys.argv) or not sys.argv[workflow_index].strip():
+            raise SystemExit("用法：--workflow-group <群名>")
+        workflow_log = None
+        if "--workflow-log" in sys.argv:
+            log_index = sys.argv.index("--workflow-log") + 1
+            if log_index >= len(sys.argv) or not sys.argv[log_index].strip():
+                raise SystemExit("用法：--workflow-log <日志路径>")
+            workflow_log = Path(sys.argv[log_index])
+        raise SystemExit(main(sys.argv[workflow_index], workflow_log))
+    elif "--workflow-log" in sys.argv:
+        raise SystemExit("用法：--workflow-group <群名> --workflow-log <日志路径>")
     else:
         main()

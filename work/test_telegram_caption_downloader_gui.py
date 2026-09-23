@@ -4,6 +4,8 @@ import json
 import logging
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -28,7 +30,10 @@ from telegram_caption_downloader_gui import (
     save_capture_status,
     format_duration,
     format_processing_status,
+    thread_stack_dump,
     image_groups_are_similar,
+    TIANJI_MIN_COLOR_INTERSECTION,
+    TIANJI_MAX_ASPECT_RATIO,
     collect_adjacent_preview_messages,
     collect_adjacent_first_preview_messages,
     ocr_labels_from_payload,
@@ -70,6 +75,10 @@ from telegram_caption_downloader_gui import (
     filter_unwanted_ocr_groups,
     OcrError,
     get_ocr_engine,
+    load_window_preset,
+    save_window_preset,
+    WINDOW_PRESETS,
+    load_group_notes,
 )
 
 
@@ -208,6 +217,30 @@ class CoreLogicTests(unittest.TestCase):
         self.assertNotIn(1, selected)
         self.assertNotIn(2, selected)
 
+    def test_tianji_rechecks_new_neighbor_pair_without_repeating_ocr(self):
+        label = {"天机阁杀料"}
+        messages = [SimpleNamespace(id=i, raw_text="", grouped_id=i) for i in range(1, 5)]
+        selection = {1: set(label), 4: set(label)}
+        checked, cache = set(), {}
+        pairs = []
+
+        def compare(anchor, candidate):
+            pairs.append((anchor[0].id, candidate[0].id))
+            return anchor[0].id == 3
+
+        with patch("telegram_caption_downloader_gui.ocr_labels_from_payload",
+                   side_effect=lambda payload, *a, **kw: label if payload == b"3" else set()) as ocr:
+            for expected in ({2, 3}, {2}):
+                self.assertEqual(collect_adjacent_first_preview_messages(
+                    messages, selection, label, label, checked_pairs=checked), expected)
+                selection = add_first_image_ocr_immediate_groups(
+                    messages, selection, label, {2: b"2", 3: b"3"}, bidirectional_labels=label,
+                    checked_pairs=checked, ocr_cache=cache, group_similarity=compare,
+                )
+            self.assertEqual(ocr.call_count, 2)
+        self.assertEqual(pairs, [(1, 2), (3, 2)])
+        self.assertEqual(set(selection), {1, 2, 3, 4})
+
     def test_huangdaxian_first_image_classifies_by_detected_label_and_skips_second_image(self):
         labels = {"战狼", "68", "红人馆", "香奈儿"}
         self.assertEqual(HUANGDAXIAN_ADJACENT_LABELS, labels)
@@ -273,6 +306,13 @@ class CoreLogicTests(unittest.TestCase):
             ),
             set(),
         )
+        for text in ("天机阁", "天機閣", "天机", "天王", "手机", "天機"):
+            with self.subTest(text=text):
+                labels = {"天机阁特围", "天机阁杀料"}
+                self.assertEqual(
+                    ocr_labels_from_payload(payload.getvalue(), labels, FakeOCR(text)),
+                    labels if text in {"天机阁", "天機閣", "天机"} else set(),
+                )
 
     def test_local_account_selection_validates_id_and_preserves_secrets(self):
         from telegram_caption_downloader_gui import load_selected_account, save_selected_account
@@ -361,6 +401,47 @@ class CoreLogicTests(unittest.TestCase):
                 save_group_profile(root, again, "", "私密二", "", chat_id=-1001)
             with self.assertRaises(ValueError):
                 save_group_profile(root, again, "", "私密三", "", chat_id=1001, bound_account_id="legacy")
+
+    def test_group_notes_support_per_link_exclusive_lists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "群.json"
+            path.write_text(json.dumps({
+                "keywords": ["战狼", "香奈儿", "绿图/⭐绿图"],
+                "links": {"https://t.me/amlhmfzl": ["综合", "两版绿杀+完美杀"]},
+            }, ensure_ascii=False), encoding="utf-8")
+            default_notes, address_notes = load_group_notes(path)
+            self.assertEqual(default_notes["战狼"], "战狼")
+            self.assertEqual(default_notes["⭐绿图"], "绿图")
+            self.assertEqual(
+                address_notes,
+                {"https://t.me/amlhmfzl": {"综合": "综合", "两版绿杀+完美杀": "两版绿杀+完美杀"}},
+            )
+            path.write_text(json.dumps({"keywords": [], "links": {"x": []}}, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_group_notes(path)
+            path.write_text(json.dumps({"keywords": [], "links": ["x"]}, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_group_notes(path)
+            path.write_text(json.dumps({"keywords": ["战狼"]}, ensure_ascii=False), encoding="utf-8")
+            self.assertEqual(load_group_notes(path), ({"战狼": "战狼"}, {}))
+
+    def test_window_preset_round_trip_and_validation(self):
+        self.assertEqual(WINDOW_PRESETS, {"2k": (1440, 860), "1080": (1440, 860)})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(load_window_preset(root), "")
+            save_window_preset(root, "2k")
+            self.assertEqual(load_window_preset(root), "2k")
+            self.assertEqual(
+                json.loads((root / "ui_settings.json").read_text(encoding="utf-8")),
+                {"window_preset": "2k"},
+            )
+            save_window_preset(root, "1080")
+            self.assertEqual(load_window_preset(root), "1080")
+            (root / "ui_settings.json").write_text('{"window_preset":"4k"}', encoding="utf-8")
+            self.assertEqual(load_window_preset(root), "")
+            with self.assertRaises(ValueError):
+                save_window_preset(root, "8k")
 
     def test_resolve_private_chat_uses_cache_then_dialogs(self):
         from telethon import utils
@@ -598,9 +679,10 @@ class CoreLogicTests(unittest.TestCase):
         clients = []
 
         class FakeClient:
-            def __init__(self, *args, base_logger):
-                self.logger = base_logger.getChild("client.users")
+            def __init__(self, *args, **kwargs):
+                self.logger = kwargs["base_logger"].getChild("client.users")
                 self.disconnected = False
+                self.kwargs = kwargs
                 clients.append(self)
 
             def disconnect(self):
@@ -965,6 +1047,22 @@ class CoreLogicTests(unittest.TestCase):
         self.assertFalse(image_groups_are_similar([blue], [red]))
         self.assertFalse(image_groups_are_similar([blue], [image_bytes((70, 180, 230), size=(1280, 300))]))
 
+    def test_tianji_similarity_uses_its_own_color_and_aspect_limits(self):
+        def payload(color, size=(100, 200)):
+            buffer = io.BytesIO()
+            Image.new("RGB", size, color).save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        anchor = payload((254, 247, 223))
+        partial_color = payload((254, 247, 80))
+        stretched = payload((254, 247, 223), (125, 200))
+        limits = dict(min_intersection=TIANJI_MIN_COLOR_INTERSECTION,
+                      max_aspect_ratio=TIANJI_MAX_ASPECT_RATIO)
+        for other in (partial_color, stretched):
+            self.assertTrue(image_groups_are_similar([anchor], [other]))
+            self.assertFalse(image_groups_are_similar([anchor], [other], **limits))
+        self.assertTrue(image_groups_are_similar([partial_color, anchor], [stretched, anchor], **limits))
+
     def test_special_labels_use_exact_caption_matching(self):
         notes = {"战狼": "战狼"}
         messages = [
@@ -1186,7 +1284,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.2.5")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.2.9")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -1195,6 +1293,57 @@ class GuiFlowTests(unittest.TestCase):
         self.app.api_id.set("not-a-number")
         with self.assertRaises(ValueError):
             self.app.credentials()
+
+    def test_thread_stack_dump_reports_every_thread(self):
+        dump = thread_stack_dump()
+        self.assertIn("MainThread", dump)
+        self.assertIn("test_thread_stack_dump_reports_every_thread", dump)
+
+    def test_open_with_shell_never_runs_on_the_ui_thread(self):
+        calls = []
+
+        def record(target):
+            calls.append((target, threading.current_thread() is threading.main_thread()))
+
+        with patch("telegram_caption_downloader_gui.os.startfile", side_effect=record):
+            self.app._open_with_shell("C:/tmp/example.json")
+            for _ in range(100):
+                if calls:
+                    break
+                time.sleep(0.02)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "C:/tmp/example.json")
+        self.assertFalse(calls[0][1], "os.startfile 跑在界面线程会卡死窗口")
+
+    def test_freeze_dump_is_written_to_the_runtime_log(self):
+        self.app._freeze_dump(7.0)
+        logs = list((Path(self.app_directory.name) / "program" / "运行日志").rglob("*.log"))
+        self.assertTrue(logs)
+        content = max(logs, key=lambda path: path.stat().st_mtime).read_text(encoding="utf-8")
+        self.assertIn("界面线程无响应", content)
+        self.assertIn("线程堆栈", content)
+
+    def test_group_click_while_busy_does_not_restorm_selection_events(self):
+        self.app._busy = True
+        self.app.group_list.insert("", "end", iid="甲", values=("", "甲"))
+        self.app.group_list.insert("", "end", iid="乙", values=("", "乙"))
+        self.app.chat.set("甲")
+        self.app.group_list.selection_set("甲")
+        calls = []
+        real_select = self.app.group_list.selection_set
+
+        def counted(items):
+            calls.append(items)
+            if len(calls) > 5:  # 真出回归时不要让测试进程挂死
+                return None
+            return real_select(items)
+
+        with patch.object(self.app.group_list, "selection_set", side_effect=counted):
+            self.app.group_list.selection_set("乙")
+            for _ in range(5):
+                self.root.update()
+        self.assertEqual(self.app.group_list.selection(), ("甲",))
+        self.assertLessEqual(len(calls), 2)
 
     def test_main_window_opens_centered_on_screen(self):
         self.root.deiconify()
@@ -1211,17 +1360,16 @@ class GuiFlowTests(unittest.TestCase):
         self.assertAlmostEqual(window_center[1], screen_center[1], delta=3)
 
     def test_dark_workspace_layout_and_login_settings_entry(self):
-        self.assertEqual(self.root.cget("background").lower(), "#17191d")
-        self.assertEqual(self.app.sidebar.winfo_manager(), "pack")
-        self.assertEqual(self.app.extract_nav.cget("text"), "提取")
-        self.assertEqual(self.app.group_nav.cget("text"), "群组")
-        self.assertEqual(self.app.history_nav.cget("text"), "历史")
-        self.assertEqual(self.app.settings_nav.cget("text"), "设置")
+        self.assertEqual(self.root.cget("background").lower(), "#161719")
+        self.assertEqual(self.app.group_list.winfo_manager(), "pack")
+        self.assertEqual(self.app.group_button.cget("text"), "群组设置")
+        self.assertEqual(self.app.status_button.cget("text"), "查看抓取状态")
+        self.assertEqual(self.app.retry_button.cget("text"), "复抓")
+        self.assertEqual(self.app.open_button.cget("text"), "打开结果")
         self.assertEqual(self.app.start_button.cget("style"), "Accent.TButton")
         self.assertEqual(self.app.clear_button.cget("style"), "Danger.TButton")
-        self.assertEqual(self.app.log_box.cget("background").lower(), "#15171a")
+        self.assertEqual(self.app.log_box.cget("background").lower(), "#111214")
         body_font = Font(root=self.root, font=self.app.style.lookup(".", "font"))
-        title_font = Font(root=self.root, font=self.app.style.lookup("Title.TLabel", "font"))
         log_font = Font(root=self.root, font=self.app.log_box.cget("font"))
         entry_font = Font(root=self.root, font=self.app.style.lookup("Dark.TEntry", "font"))
         combo_font = Font(root=self.root, font=self.app.style.lookup("Dark.TCombobox", "font"))
@@ -1229,7 +1377,6 @@ class GuiFlowTests(unittest.TestCase):
         form_label_font = Font(root=self.root, font=self.app.style.lookup("Card.TLabel", "font"))
         checkbox_font = Font(root=self.root, font=self.app.style.lookup("TCheckbutton", "font"))
         self.assertGreaterEqual(body_font.actual("size"), 12)
-        self.assertGreaterEqual(title_font.actual("size"), 24)
         self.assertGreaterEqual(log_font.actual("size"), 11)
         self.assertGreaterEqual(entry_font.actual("size"), 13)
         self.assertGreaterEqual(combo_font.actual("size"), 13)
@@ -1243,6 +1390,223 @@ class GuiFlowTests(unittest.TestCase):
         self.assertTrue(self.app.login_settings_window.winfo_exists())
         self.assertEqual(self.app.login_settings_window.title(), "选择 Telegram 账号")
         self.app.login_settings_window.destroy()
+
+    def test_group_list_marks_captured_groups_red_and_follows_selection(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "已抓群", "@a")
+        save_group_profile(self.app.program_root, self.app.settings, "", "未抓群", "@b")
+        self.app.reload_group_profiles("未抓群")
+        output = Path(self.app_directory.name) / "result"
+        self.app.output_path.set(str(output))
+        self.app.day.set("2026-09-05")
+        dated_group_output(output, date(2026, 9, 5), "已抓群").mkdir(parents=True)
+        self.app.update_first_capture_status()
+        self.assertEqual(list(self.app.group_list.get_children()), ["已抓群", "未抓群"])
+        self.assertEqual(self.app.group_list.item("已抓群", "tags"), ("captured",))
+        self.assertFalse(self.app.group_list.item("未抓群", "tags"))
+        self.assertEqual(str(self.app.group_list.tag_configure("captured", "foreground")), "#E0715B")
+        self.assertEqual(self.app.group_list.selection(), ("未抓群",))
+        self.app.group_list.selection_set("已抓群")
+        self.app.on_group_list_selected()
+        self.assertEqual(self.app.chat.get(), "已抓群")
+        self.assertEqual(self.app.first_capture_status.get(), "今日已首抓")
+
+    def test_per_link_notes_match_exclusively_and_keep_same_message_ids(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@a | @b")
+        self.app.reload_group_profiles("测试群")
+        (self.app.program_root / "群配置" / "测试群.json").write_text(
+            json.dumps({"keywords": ["战狼"], "links": {"@b": ["综合"]}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+
+        class Message:
+            grouped_id = None
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+
+            def __init__(self, message_id, caption):
+                self.id, self.raw_text = message_id, caption
+
+            async def download_media(self, file):
+                Path(file).write_bytes(b"image")
+                return file
+
+        messages_by_source = {
+            "@a": [Message(1000, "战狼"), Message(1001, "综合")],
+            "@b": [Message(1000, "综合"), Message(1001, "战狼")],
+        }
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, entity, **_kwargs):
+                return iter(messages_by_source[entity])
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download()
+        group_dir = root / "results" / "9.2-测试群"
+        self.assertEqual(len(list((group_dir / "战狼").glob("*.jpg"))), 1)
+        self.assertEqual(len(list((group_dir / "综合").glob("*.jpg"))), 1)
+        status = load_capture_status(capture_status_path(self.app.status_root, "测试群"))
+        self.assertEqual(status["remarks"]["战狼"]["status"], "已完成")
+        self.assertEqual(status["remarks"]["战狼"]["image_message_ids"], [1000])
+        self.assertEqual(status["remarks"]["综合"]["status"], "已完成")
+        self.assertEqual(status["remarks"]["综合"]["image_message_ids"], [1000])
+        self.assertEqual((group_dir / "未匹配备注.txt").read_text(encoding="utf-8-sig"), "")
+
+    def test_group_list_click_switches_group_via_real_event(self):
+        self.assertTrue(self.app.group_list.bind("<<TreeviewSelect>>"))
+        self.assertFalse(self.app.group_list.bind("<<ListboxSelect>>"))
+        save_group_profile(self.app.program_root, self.app.settings, "", "切换群", "@switch")
+        save_group_profile(self.app.program_root, self.app.settings, "", "目标群", "@target")
+        self.app.reload_group_profiles("切换群")
+        self.assertEqual(self.app.chat.get(), "切换群")
+        self.app.group_list.selection_set("目标群")
+        self.app.group_list.event_generate("<<TreeviewSelect>>")
+        self.root.update()
+        self.assertEqual(self.app.chat.get(), "目标群")
+        self.assertEqual(
+            self.app.notes_path.get(),
+            str(self.app.program_root / "群配置" / "目标群.json"),
+        )
+        self.assertEqual(self.app.settings["selected_group"], "目标群")
+
+    def test_window_preset_defaults_follow_screen_width(self):
+        with patch("telegram_caption_downloader_gui.load_window_preset", return_value=""):
+            with patch.object(self.root, "winfo_screenwidth", return_value=2048):
+                self.assertEqual(self.app._initial_window_preset(), "2k")
+            with patch.object(self.root, "winfo_screenwidth", return_value=1920):
+                self.assertEqual(self.app._initial_window_preset(), "1080")
+        with patch("telegram_caption_downloader_gui.load_window_preset", return_value="1080"):
+            self.assertEqual(self.app._initial_window_preset(), "1080")
+
+    def test_window_preset_switch_saves_and_restarts_only_when_changed(self):
+        root = Path(self.app_directory.name)
+        self.app.window_preset = "1080"
+        with (
+            patch("telegram_caption_downloader_gui.messagebox.showinfo") as info,
+            patch.object(self.app, "restart_application") as restart,
+        ):
+            self.app.choose_window_preset("1080")
+            restart.assert_not_called()
+            info.assert_called_once()
+            self.app.choose_window_preset("2k")
+            restart.assert_called_once()
+        self.assertEqual(load_window_preset(root), "2k")
+        with (
+            patch("telegram_caption_downloader_gui.messagebox.showwarning") as warning,
+            patch.object(self.app, "restart_application") as restart,
+        ):
+            self.app.set_busy(True)
+            self.app.choose_window_preset("1080")
+            self.app.set_busy(False)
+        warning.assert_called_once()
+        restart.assert_not_called()
+        self.assertEqual(load_window_preset(root), "2k")
+
+    def test_login_client_uses_bounded_connection_timeout(self):
+        captured = {}
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+
+            def disconnect(self):
+                pass
+
+        with patch("telethon.sync.TelegramClient", FakeClient):
+            with logged_telegram_client("unused", 123, "SECRET", lambda text: None):
+                pass
+        self.assertEqual(captured.get("timeout"), 15)
+        self.assertEqual(captured.get("connection_retries"), 2)
+
+    def test_worker_thread_callbacks_are_delivered_by_queue_pump(self):
+        results = []
+
+        def worker():
+            self.app._post_to_main(lambda: results.append("worker"))
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        self.assertEqual(results, [])
+        self.app._pump_ui_callbacks()
+        self.assertEqual(results, ["worker"])
+        self.app._post_to_main(lambda: results.append("main"))
+        self.root.update()
+        self.assertEqual(results, ["worker", "main"])
+
+    def test_login_watchdog_recovers_busy_ui_once(self):
+        self.app.set_busy(True, "准备中…")
+        self.app._login_token = "token-a"
+        with patch.object(self.app, "open_login_settings") as opener:
+            self.app._login_watchdog("token-stale")
+            self.assertIn("准备中", self.app.task_status.get())
+            self.app._login_watchdog("token-a")
+        self.assertEqual(self.app._login_token, "")
+        self.assertIn("登录超时", self.app.task_status.get())
+        self.assertFalse(self.app._busy)
+        opener.assert_called_once()
+
+    def test_login_failure_opens_account_window(self):
+        original_after = self.app.root.after
+        self.app.root.after = lambda _delay, callback: callback()
+
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with (
+            patch("telegram_caption_downloader_gui.threading.Thread", ImmediateThread),
+            patch("telegram_caption_downloader_gui.messagebox.showerror"),
+            patch.object(self.app, "open_login_settings") as opener,
+        ):
+            self.app.run_worker(
+                lambda: (_ for _ in ()).throw(RuntimeError("test failure")),
+                lambda _result: None,
+                on_failure=self.app.open_login_settings,
+            )
+        self.app.root.after = original_after
+        opener.assert_called_once()
+
+    def test_login_dialog_highlights_current_window_preset(self):
+        self.app.window_preset = "2k"
+        self.app.open_login_settings()
+        self.root.update()
+        try:
+            self.assertEqual(str(self.app._preset_buttons["2k"].cget("style")), "PresetActive.TButton")
+            self.assertEqual(str(self.app._preset_buttons["1080"].cget("style")), "Preset.TButton")
+            self.app.window_preset = "1080"
+            self.app._refresh_preset_buttons()
+            self.assertEqual(str(self.app._preset_buttons["1080"].cget("style")), "PresetActive.TButton")
+        finally:
+            self.app.login_settings_window.destroy()
 
     def test_settings_windows_center_on_main_and_keep_button_text_visible(self):
         self.root.deiconify()
@@ -1618,7 +1982,7 @@ class GuiFlowTests(unittest.TestCase):
             def disconnect(self):
                 pass
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         with (
             patch("telethon.sync.TelegramClient", FakeClient),
             patch("telegram_caption_downloader_gui.messagebox.showinfo"),
@@ -1685,7 +2049,8 @@ class GuiFlowTests(unittest.TestCase):
                 try:
                     with (
                         patch("telethon.sync.TelegramClient", return_value=client) as factory,
-                        patch.object(TelegramDownloaderApp, "run_worker", lambda _, operation, success: success(operation())),
+                        patch.object(TelegramDownloaderApp, "run_worker",
+                                     lambda _, operation, success, on_failure=None: success(operation())),
                         patch("telegram_caption_downloader_gui.messagebox.showinfo") as info,
                     ):
                         app = TelegramDownloaderApp(root, app_data=app_data, program_root=self.app.program_root,
@@ -1713,7 +2078,7 @@ class GuiFlowTests(unittest.TestCase):
         original_session = session.read_bytes()
         client = MagicMock()
         client.is_user_authorized.return_value = False
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         with patch("telethon.sync.TelegramClient", return_value=client):
             with self.assertRaisesRegex(RuntimeError, "失效"):
                 self.app.login(automatic=True)
@@ -1812,7 +2177,7 @@ class GuiFlowTests(unittest.TestCase):
         client.get_me.return_value = SimpleNamespace(first_name="wrong", id=8, phone="8613900000000")
         self.app.logged_in = True
         self.app.active_account_id = "legacy"
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         with patch("telethon.sync.TelegramClient", return_value=client):
             with self.assertRaises(RuntimeError):
                 self.app.login()
@@ -1838,7 +2203,7 @@ class GuiFlowTests(unittest.TestCase):
         client.is_user_authorized.return_value = False
         client.sign_in.side_effect = [SessionPasswordNeededError(None), None]
         client.get_me.return_value = SimpleNamespace(id=8, phone="8613900000000", first_name="新号", username=None)
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         with (
             patch("telethon.sync.TelegramClient", return_value=client) as factory,
             patch.object(self.app, "ask_secret", side_effect=["123456", "secret-password"]) as ask,
@@ -1864,7 +2229,7 @@ class GuiFlowTests(unittest.TestCase):
         from unittest.mock import MagicMock
         client = MagicMock()
         client.is_user_authorized.return_value = False
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         with (
             patch("telethon.sync.TelegramClient", return_value=client),
             patch.object(self.app, "ask_secret", side_effect=RuntimeError("登录已取消")),
@@ -1933,7 +2298,7 @@ class GuiFlowTests(unittest.TestCase):
             def iter_messages(self, _entity, **_kwargs):
                 return iter([Message()])
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
             self.app.start_download()
@@ -1990,7 +2355,7 @@ class GuiFlowTests(unittest.TestCase):
             def iter_messages(self, _entity, **_kwargs):
                 return iter(())
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
             self.app.start_download()
@@ -2043,7 +2408,7 @@ class GuiFlowTests(unittest.TestCase):
             def is_user_authorized(self):
                 return False
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with patch("telethon.sync.TelegramClient", ExpiredClient), \
              patch("telegram_caption_downloader_gui.messagebox.showinfo"):
@@ -2145,7 +2510,7 @@ class GuiFlowTests(unittest.TestCase):
 
                 return stream()
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
             self.app.start_download(retry=True)
@@ -2193,7 +2558,7 @@ class GuiFlowTests(unittest.TestCase):
             def iter_messages(self, _entity, **_kwargs):
                 return iter([Message()])
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
             self.app.start_download()
@@ -2264,7 +2629,7 @@ class GuiFlowTests(unittest.TestCase):
             def get_messages(self, _entity, ids):
                 return [next((message for message in messages if message.id == item), None) for item in ids]
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         status_path = capture_status_path(self.app.status_root, "黄大仙新澳")
         group_output = root / "results" / "9.2-黄大仙新澳"
@@ -2315,7 +2680,7 @@ class GuiFlowTests(unittest.TestCase):
             self.root.update()
             self.assertFalse(self.app.task_status.get().startswith("完成："))
 
-    def test_yanran_tianji_flow_ocr_reads_only_neighbor_first_images(self):
+    def test_yanran_tianji_flow_extends_by_ocr_or_any_image_pair_until_both_miss(self):
         root = Path(self.app_directory.name)
         save_group_profile(self.app.program_root, self.app.settings, "", "嫣然心水", "@yanran")
         self.app.reload_group_profiles("嫣然心水")
@@ -2324,6 +2689,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app.output_path.set(str(root / "results"))
         self.app.day.set("2026-09-02")
         preview_calls = []
+        ocr_calls = []
 
         class Message:
             date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
@@ -2342,14 +2708,30 @@ class GuiFlowTests(unittest.TestCase):
                 Path(file).write_bytes(b"image")
                 return file
 
-        messages = [
-            Message(2, "", 10, b"second-image-hit"),
-            Message(1, "", 10, b"first-image-miss"),
-            Message(4, "天机阁杀料", 20, b"anchor-second"),
-            Message(3, "", 20, b"anchor-first"),
-            Message(6, "", 30, b"second-image-ignored"),
-            Message(5, "", 30, b"first-image-hit"),
-        ]
+        payloads = {}
+        for message_id in range(1, 21):
+            color = (40, 90, 220)
+            if message_id in {3, 4, 17, 18}:
+                color = (0, 0, 0)
+            elif message_id in {5, 11, 13}:
+                color = (210, 30, 70)
+            elif message_id in {15, 16}:
+                color = (255, 255, 255)
+            image = Image.new("RGB", (72, 128), color)
+            image.putpixel((0, 0), (message_id, 1, 2))
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            payloads[message_id] = buffer.getvalue()
+        messages = []
+        for first_id in range(1, 20, 2):
+            # Non-first blue images rescue groups whose red first image misses OCR.
+            messages.extend([
+                Message(first_id + 1, "天机阁杀料" if first_id == 9 else "", first_id, payloads[first_id + 1]),
+                Message(first_id, "", first_id, payloads[first_id]),
+            ])
+        outside_range = Message(21, "", 21, b"21")
+        outside_range.date = datetime(2026, 9, 3, 4, 0, tzinfo=timezone.utc)
+        messages.insert(0, outside_range)
 
         class Client:
             def __init__(self, *_args, **_kwargs):
@@ -2374,26 +2756,30 @@ class GuiFlowTests(unittest.TestCase):
                 return iter(messages)
 
         def fake_ocr(payload, labels, _engine, on_error=None):
-            return {"天机阁杀料"} if payload == b"first-image-hit" else set()
+            ocr_calls.append(payload)
+            return {"天机阁杀料"} if payload in {payloads[7], payloads[15]} else set()
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with (
             patch("telethon.sync.TelegramClient", Client),
             patch("telegram_caption_downloader_gui.messagebox.showinfo"),
             patch("telegram_caption_downloader_gui.get_ocr_engine", return_value=object()),
             patch("telegram_caption_downloader_gui.ocr_labels_from_payload", side_effect=fake_ocr),
-            patch("telegram_caption_downloader_gui.image_groups_are_similar") as similarity,
+            patch("telegram_caption_downloader_gui.image_groups_are_similar",
+                  wraps=image_groups_are_similar) as similarity,
         ):
             self.app.start_download()
-        self.assertEqual(set(preview_calls), {1, 5})
-        self.assertNotIn(2, preview_calls)
-        self.assertNotIn(6, preview_calls)
-        similarity.assert_not_called()
+        self.assertCountEqual(preview_calls, range(3, 19))
+        self.assertCountEqual(ocr_calls, [payloads[message_id] for message_id in (3, 5, 7, 11, 13, 15, 17)])
+        self.assertEqual(similarity.call_count, 5)
+        for call in similarity.call_args_list:
+            self.assertEqual(call.kwargs, dict(min_intersection=TIANJI_MIN_COLOR_INTERSECTION,
+                                               max_aspect_ratio=TIANJI_MAX_ASPECT_RATIO))
         output = root / "results" / "9.2-嫣然心水" / "天机阁杀料"
-        self.assertEqual(len(list(output.glob("*.jpg"))), 4)
+        self.assertEqual(len(list(output.glob("*.jpg"))), 12)
         status = load_capture_status(capture_status_path(self.app.status_root, "嫣然心水"))
-        self.assertEqual(status["remarks"]["天机阁杀料"]["image_message_ids"], [3, 4, 5, 6])
+        self.assertEqual(status["remarks"]["天机阁杀料"]["image_message_ids"], list(range(5, 17)))
 
     def test_yanran_guaiguai_flow_extends_similar_groups_two_steps(self):
         root = Path(self.app_directory.name)
@@ -2456,7 +2842,7 @@ class GuiFlowTests(unittest.TestCase):
             def iter_messages(self, _entity, **_kwargs):
                 return iter(messages)
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with (
             patch("telethon.sync.TelegramClient", Client),
@@ -2522,7 +2908,7 @@ class GuiFlowTests(unittest.TestCase):
         def fake_ocr(payload, labels, _engine, on_error=None, cleanup=None):
             return {"实力双波"} if payload == b"unwanted-cover" else set()
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with (
             patch("telethon.sync.TelegramClient", Client),
@@ -2592,7 +2978,7 @@ class GuiFlowTests(unittest.TestCase):
             def iter_messages(self, _entity, **_kwargs):
                 return iter(messages)
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with (
             patch("telethon.sync.TelegramClient", Client),
@@ -2664,7 +3050,7 @@ class GuiFlowTests(unittest.TestCase):
         def fake_ocr(payload, requested_labels, _engine, on_error=None):
             return {"68"} if payload == b"hit-68" else {"红人馆"} if payload == b"hit-red" else set()
 
-        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
         with (
             patch("telethon.sync.TelegramClient", Client),
@@ -2778,7 +3164,7 @@ class GuiFlowTests(unittest.TestCase):
             self.app.set_progress = lambda current, total, status, **kwargs: progress_updates.append(
                 (current, total, status)
             )
-            self.app.run_worker = lambda operation, success: success(operation())
+            self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
             with (
                 patch("telethon.sync.TelegramClient", FakeClient),
                 patch("telegram_caption_downloader_gui.messagebox.showinfo"),
@@ -2803,7 +3189,7 @@ class GuiFlowTests(unittest.TestCase):
             ]
             self.assertEqual(len(completed_updates), 1)
             self.assertRegex(self.app.task_status.get(), r"^完成：3 / 3｜总耗时 \d{2}:\d{2}(?::\d{2})?$")
-            self.assertEqual(DOWNLOAD_CONCURRENCY, 16)
+            self.assertEqual(DOWNLOAD_CONCURRENCY, 6)
             self.assertEqual(FakeMessage.max_active_downloads, 3)
             events = runtime_log_path(self.app.log_root, datetime.now().date(), "测试群").read_text(encoding="utf-8")
             for category in ("复抓", "状态", "扫描", "识别", "下载", "汇总"):
