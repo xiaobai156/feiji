@@ -397,6 +397,11 @@ def migrate_legacy_account(app_data: Path) -> str:
     if not (root / "credentials.bin").is_file():
         return ""
     profiles = read_account_entries(root)
+    has_legacy = any(isinstance(item, dict) and item.get("id") == "legacy" for item in profiles)
+    if profiles and not has_legacy:
+        # 清单里已无 legacy 条目：说明迁移早已完成（只剩根目录残留），或本就不是旧版数据。
+        # 此时再迁一次会凭空多出一个账号，所以直接放弃。
+        return ""
     name, user_id = "原有账号", None
     remaining = []
     for item in profiles:

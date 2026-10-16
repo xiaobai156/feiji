@@ -509,6 +509,16 @@ class CoreLogicTests(unittest.TestCase):
             self.assertFalse((root / "accounts.json").exists())
             self.assertEqual(list((root / "accounts").glob("*")), [])
 
+    def test_legacy_migration_is_skipped_once_the_manifest_has_no_legacy_entry(self):
+        # 清单已切走但根目录原件残留（例如上次删原件失败）时，绝不能凭空多建一个账号。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_saved_credentials(root / "credentials.bin", 123, "original-hash", "+8613800000000")
+            existing = create_account_profile(root, "已有号", 456, "other-hash", "+8613900000000")
+            self.assertEqual(migrate_legacy_account(root), "")
+            self.assertEqual([item["id"] for item in load_account_profiles(root)], [existing["id"]])
+            self.assertEqual(list((root / "accounts").glob("*")), [account_directory(root, existing["id"])])
+
     def test_legacy_sqlite_session_is_migrated_to_encrypted_string(self):
         from telethon.crypto import AuthKey
         from telethon.sessions import SQLiteSession, StringSession
@@ -2454,9 +2464,12 @@ class GuiFlowTests(unittest.TestCase):
         )
 
     def test_startup_opens_account_chooser_without_selecting_or_connecting(self):
-        app_data = Path(self.app_directory.name)
-        (app_data / "account_selection.json").unlink(missing_ok=True)
+        # 全新数据目录 + 旧版根目录凭据：启动时应先迁移，再打开账号弹窗且不自动登录。
+        app_data = Path(self.app_directory.name) / "legacy-app"
+        app_data.mkdir()
         save_saved_credentials(app_data / "credentials.bin", 9876, "saved-hash", "+8613900000000")
+        (app_data / "accounts.json").write_text(
+            json.dumps({"accounts": [{"id": "legacy", "name": "原有账号", "user_id": None}]}), encoding="utf-8")
         second_root = Tk()
         try:
             with patch("telethon.sync.TelegramClient") as client:
