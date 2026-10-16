@@ -2,7 +2,7 @@
   "groups": [
     {
       "name": "嫣然心水",
-      "address": "https://t.me/LHChaha",
+      "address": "https://t.me/lhcxinshui",
       "start_time": "00:00",
       "end_time": "23:59"
     },
@@ -10,33 +10,93 @@
       "name": "新澳六合彩资料",
       "address": "https://t.me/amlhcq",
       "start_time": "00:00",
-      "end_time": "23:59"
+      "end_time": "23:59",
+      "auto_capture": {
+        "enabled": true,
+        "first_time": "18:35",
+        "second_time": "19:05",
+        "min_images": 1000,
+        "last_discovered_images": 0,
+        "last_discovered_date": "2026-10-16",
+        "first_attempt_date": "2026-10-16",
+        "second_attempt_date": "2026-10-16",
+        "threshold_met_date": "",
+        "captured_date": ""
+      }
     },
     {
       "name": "新澳高级会员",
       "address": "https://t.me/LHCKjQ",
       "start_time": "00:00",
-      "end_time": "23:59"
+      "end_time": "23:59",
+      "auto_capture": {
+        "enabled": true,
+        "first_time": "17:30",
+        "second_time": "18:25",
+        "min_images": 170,
+        "last_discovered_images": 0,
+        "last_discovered_date": "2026-10-16",
+        "first_attempt_date": "2026-10-16",
+        "second_attempt_date": "2026-10-16",
+        "threshold_met_date": "",
+        "captured_date": ""
+      }
     },
     {
       "name": "新澳高手",
       "address": "https://t.me/XAMlHC0 | https://t.me/lhcye",
       "start_time": "00:00",
-      "end_time": "23:59"
+      "end_time": "23:59",
+      "auto_capture": {
+        "enabled": true,
+        "first_time": "20:10",
+        "second_time": "20:25",
+        "min_images": 500,
+        "last_discovered_images": 682,
+        "last_discovered_date": "2026-10-16",
+        "first_attempt_date": "2026-10-16",
+        "second_attempt_date": "",
+        "threshold_met_date": "2026-10-16",
+        "captured_date": ""
+      }
     },
     {
       "name": "黄大仙新澳",
-      "address": "https://t.me/lhcxinao | https://t.me/lhcye",
+      "address": "https://t.me/lhcxinao | https://t.me/lhcye | https://t.me/amlhmfzl",
       "start_time": "00:00",
-      "end_time": "23:59"
+      "end_time": "23:59",
+      "auto_capture": {
+        "enabled": true,
+        "first_time": "19:20",
+        "second_time": "19:40",
+        "min_images": 1100,
+        "last_discovered_images": 1336,
+        "last_discovered_date": "2026-10-16",
+        "first_attempt_date": "2026-10-16",
+        "second_attempt_date": "",
+        "threshold_met_date": "2026-10-16",
+        "captured_date": ""
+      }
     },
     {
-      "name": "蜻蜓一套骁腾",
+      "name": "蜻蜓一套",
       "address": "https://t.me/xam49 | https://t.me/xamlh | https://t.me/liuhecai22222",
       "start_time": "00:00",
-      "end_time": "23:59"
+      "end_time": "23:59",
+      "auto_capture": {
+        "enabled": true,
+        "first_time": "19:45",
+        "second_time": "19:55",
+        "min_images": 600,
+        "last_discovered_images": 839,
+        "last_discovered_date": "2026-10-16",
+        "first_attempt_date": "2026-10-16",
+        "second_attempt_date": "",
+        "threshold_met_date": "2026-10-16",
+        "captured_date": ""
+      }
     }
   ],
-  "selected_group": "蜻蜓一套骁腾",
+  "selected_group": "新澳高级会员",
   "output_path": "C:\\Users\\Administrator\\Desktop\\每天工具\\飞机抓图\\结果"
 }

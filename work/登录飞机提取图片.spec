@@ -1,7 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from importlib.util import find_spec
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata, collect_submodules
+
+
+source_script = Path(SPECPATH) / 'telegram_caption_downloader_gui.py'
 
 
 paddlex_config_data = collect_data_files('paddlex', includes=['configs/**'])
@@ -24,7 +28,7 @@ for package_name in (
 
 
 a = Analysis(
-    ['C:/Users/Administrator/Desktop/每天工具/飞机抓图/work/telegram_caption_downloader_gui.py'],
+    [str(source_script)],
     pathex=[],
     binaries=paddle_binaries,
     datas=paddlex_config_data + ocr_dependency_metadata,
