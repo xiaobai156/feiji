@@ -44,3 +44,4 @@ work/ocr_*.json
 .venv/
 models/
 outputs/_internal/
+work/backup_*/

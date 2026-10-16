@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import io
 import json
 import logging
@@ -7,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,7 @@ from unittest.mock import patch
 from tkinter import Tk
 from tkinter.font import Font
 from PIL import Image
+import telegram_caption_downloader_gui as gui
 
 from telegram_caption_downloader_gui import (
     GroupSettingsDialog,
@@ -46,6 +49,8 @@ from telegram_caption_downloader_gui import (
     parse_clock,
     parse_day,
     safe_folder_name,
+    source_tag,
+    message_refs,
     today_result_exists,
     save_group_profile,
     save_saved_credentials,
@@ -59,6 +64,9 @@ from telegram_caption_downloader_gui import (
     account_directory,
     load_account_profiles,
     create_account_profile,
+    delete_account_profile,
+    migrate_legacy_account,
+    save_account_profile,
     verify_account_user,
     load_account_session,
     load_session_string,
@@ -79,6 +87,11 @@ from telegram_caption_downloader_gui import (
     save_window_preset,
     WINDOW_PRESETS,
     load_group_notes,
+    auto_capture_due,
+    normalize_auto_capture_settings,
+    load_manual_capture_log,
+    manual_capture_log_path,
+    record_manual_capture,
 )
 
 
@@ -91,7 +104,120 @@ def fake_session_string(seed: int = 0) -> str:
     return session.save()
 
 
+def read_report(path: Path) -> list[list[str]]:
+    """读取提取报告.csv（兼容 utf-8-sig 表头）；文件不存在时返回空列表。"""
+    if not path.is_file():
+        return []
+    return list(csv.reader(io.StringIO(path.read_text(encoding="utf-8-sig"))))
+
+
 class CoreLogicTests(unittest.TestCase):
+    def test_auto_capture_settings_validate_and_schedule_boundaries(self):
+        config = normalize_auto_capture_settings({
+            "enabled": True,
+            "first_time": "18:00",
+            "second_time": "22:30",
+            "min_images": 1000,
+        })
+        self.assertEqual(config["first_time"], "18:00")
+        self.assertEqual(config["second_time"], "22:30")
+        self.assertEqual(config["min_images"], 1000)
+        day = date(2026, 10, 3)
+        before_first = datetime(2026, 10, 3, 17, 59, tzinfo=timezone(timedelta(hours=8)))
+        after_first = datetime(2026, 10, 3, 18, 0, tzinfo=before_first.tzinfo)
+        after_second = datetime(2026, 10, 3, 22, 30, tzinfo=before_first.tzinfo)
+        self.assertIsNone(auto_capture_due(config, before_first))
+        self.assertEqual(auto_capture_due(config, after_first), 1)
+        config["first_attempt_date"] = day.isoformat()
+        self.assertIsNone(auto_capture_due(config, after_first))
+        self.assertEqual(auto_capture_due(config, after_second), 2)
+        config["captured_date"] = day.isoformat()
+        self.assertIsNone(auto_capture_due(config, after_second))
+        config["captured_date"] = ""
+        config["second_attempt_date"] = day.isoformat()
+        self.assertIsNone(auto_capture_due(config, after_second))
+        self.assertEqual(auto_capture_due(config, after_first + timedelta(days=1)), 1)
+        with self.assertRaises(ValueError):
+            normalize_auto_capture_settings({"enabled": True, "first_time": "22:00", "second_time": "21:00", "min_images": 1})
+        with self.assertRaises(ValueError):
+            normalize_auto_capture_settings({"enabled": True, "first_time": "18:00", "second_time": "22:00", "min_images": 0})
+
+    def test_manual_capture_json_log_retains_seven_days_and_deduplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = manual_capture_log_path(root)
+            today = datetime.now(gui.CN_TZ).date()
+            retained_day = today - timedelta(days=6)
+            expired_day = today - timedelta(days=7)
+            path.write_text(json.dumps({"days": {
+                expired_day.isoformat(): ["过期群"],
+                retained_day.isoformat(): ["自动群"],
+                today.isoformat(): ["自动群"],
+            }}, ensure_ascii=False), encoding="utf-8")
+            days = load_manual_capture_log(path, today)
+            self.assertEqual(days, {retained_day.isoformat(): ["自动群"], today.isoformat(): ["自动群"]})
+            record_manual_capture(path, "自动群", today)
+            record_manual_capture(path, "手动群", today)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["days"][today.isoformat()],
+                ["手动群", "自动群"],
+            )
+            # A historical or future date must never erase today's completion.
+            self.assertTrue(record_manual_capture(path, "历史群", retained_day))
+            self.assertFalse(record_manual_capture(path, "过期群", expired_day))
+            self.assertFalse(record_manual_capture(path, "未来群", today + timedelta(days=8)))
+            days = load_manual_capture_log(path, today)
+            self.assertEqual(days[today.isoformat()], ["手动群", "自动群"])
+            self.assertEqual(days[retained_day.isoformat()], ["历史群", "自动群"])
+            self.assertNotIn(retained_day.isoformat(), load_manual_capture_log(path, today + timedelta(days=1)))
+
+    def test_manual_capture_log_preserves_original_on_invalid_json_or_replace_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = manual_capture_log_path(Path(directory))
+            today = datetime.now(gui.CN_TZ).date()
+            for content in ('{"broken":', '{"days":{"invalid-date":[]}}'):
+                path.write_text(content, encoding="utf-8")
+                before = path.read_bytes()
+                with self.assertRaises(ValueError):
+                    record_manual_capture(path, "新群", today)
+                self.assertEqual(path.read_bytes(), before)
+            path.write_text(json.dumps({"days": {today.isoformat(): ["已抓群"]}}), encoding="utf-8")
+            before = path.read_bytes()
+            with patch.object(gui.os, "replace", side_effect=OSError("disk failure")):
+                with self.assertRaises(OSError):
+                    record_manual_capture(path, "新群", today)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_group_settings_keep_normalized_auto_capture_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "群配置").mkdir()
+            (root / "群配置" / "groups.json").write_text(json.dumps({
+                "groups": [{
+                    "name": "自动群", "address": "@auto", "start_time": "00:00", "end_time": "23:59",
+                    "auto_capture": {"enabled": True, "first_time": "18:00", "second_time": "22:30", "min_images": 1000},
+                }],
+                "selected_group": "自动群",
+                "output_path": str(root / "result"),
+            }, ensure_ascii=False), encoding="utf-8")
+            settings = load_group_settings(root)
+            self.assertEqual(settings["groups"][0]["auto_capture"]["first_time"], "18:00")
+            self.assertEqual(settings["groups"][0]["auto_capture"]["min_images"], 1000)
+
+    def test_invalid_auto_capture_configuration_does_not_discard_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "群配置").mkdir()
+            config = {"enabled": True, "first_time": "bad", "second_time": "22:00", "min_images": 1000}
+            path = root / "群配置" / "groups.json"
+            payload = {"groups": [{"name": "保留群", "address": "@keep", "auto_capture": config}]}
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            original = path.read_bytes()
+            loaded = load_group_settings(root, read_only=True)
+            self.assertEqual(loaded["groups"][0]["name"], "保留群")
+            self.assertEqual(loaded["groups"][0]["auto_capture"], config)
+            self.assertEqual(path.read_bytes(), original)
+
     def test_today_result_folder_controls_first_capture_state(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -318,20 +444,21 @@ class CoreLogicTests(unittest.TestCase):
         from telegram_caption_downloader_gui import load_selected_account, save_selected_account
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            save_saved_credentials(root / "credentials.bin", 123, "test-secret", "+8613800000000")
-            before = (root / "credentials.bin").read_bytes()
+            account_id = create_account_profile(root, "选择号", 123, "test-secret", "+8613800000000")["id"]
+            credentials = account_directory(root, account_id) / "credentials.bin"
+            before = credentials.read_bytes()
             self.assertEqual(load_selected_account(root), "")
-            save_selected_account(root, "legacy")
-            self.assertEqual(load_selected_account(root), "legacy")
+            save_selected_account(root, account_id)
+            self.assertEqual(load_selected_account(root), account_id)
             preference = root / "account_selection.json"
-            self.assertEqual(json.loads(preference.read_text(encoding="utf-8")), {"account_id": "legacy"})
+            self.assertEqual(json.loads(preference.read_text(encoding="utf-8")), {"account_id": account_id})
             with self.assertRaises(ValueError):
                 save_selected_account(root, "../other")
             with patch("telegram_caption_downloader_gui.os.replace", side_effect=OSError("test write failure")):
                 with self.assertRaises(OSError):
-                    save_selected_account(root, "legacy")
-            self.assertEqual(load_selected_account(root), "legacy")
-            self.assertEqual((root / "credentials.bin").read_bytes(), before)
+                    save_selected_account(root, account_id)
+            self.assertEqual(load_selected_account(root), account_id)
+            self.assertEqual(credentials.read_bytes(), before)
             preference.write_text('{"account_id":"missing"}', encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_selected_account(root)
@@ -346,24 +473,50 @@ class CoreLogicTests(unittest.TestCase):
         self.assertEqual(build_note_message_ids(messages, notes, exact_labels={"战狼"}),
                          {"战狼": {1}, "大小姐": {3}})
 
-    def test_legacy_account_is_discovered_without_moving_or_rewriting_files(self):
+    def test_legacy_root_account_is_migrated_into_a_normal_account(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             save_saved_credentials(root / "credentials.bin", 123, "original-hash", "+8613800000000")
-            original = (root / "credentials.bin").read_bytes()
+            save_session_string(root / "session.bin", "legacy-session")
             (root / "account.session").write_bytes(b"original session")
-            self.assertEqual(load_account_profiles(root), [{"id": "legacy", "name": "原有账号", "user_id": None}])
-            self.assertEqual(account_directory(root, "legacy"), root)
-            self.assertEqual((root / "credentials.bin").read_bytes(), original)
-            self.assertEqual((root / "account.session").read_bytes(), b"original session")
+            (root / "accounts.json").write_text(
+                json.dumps({"accounts": [{"id": "legacy", "name": "魂", "user_id": 42}]}), encoding="utf-8")
+            (root / "account_selection.json").write_text('{"account_id":"legacy"}', encoding="utf-8")
+            account_id = migrate_legacy_account(root)
+            self.assertRegex(account_id, r"^[0-9a-f]{32}$")
+            self.assertEqual(load_account_profiles(root), [{"id": account_id, "name": "魂", "user_id": 42}])
+            folder = account_directory(root, account_id)
+            self.assertEqual(load_saved_credentials(folder / "credentials.bin"), (123, "original-hash", "+8613800000000"))
+            self.assertEqual(load_session_string(folder / "session.bin"), "legacy-session")
+            self.assertEqual((folder / "account.session").read_bytes(), b"original session")
+            self.assertEqual(json.loads((root / "account_selection.json").read_text(encoding="utf-8")),
+                             {"account_id": account_id})
+            for leftover in ("credentials.bin", "session.bin", "account.session"):
+                self.assertFalse((root / leftover).exists())
+            # 幂等：根目录已无凭据，再跑一次不应产生第二个账号。
+            self.assertEqual(migrate_legacy_account(root), "")
+            self.assertEqual(len(load_account_profiles(root)), 1)
+
+    def test_legacy_migration_failure_keeps_root_files_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_saved_credentials(root / "credentials.bin", 123, "original-hash", "+8613800000000")
+            before = (root / "credentials.bin").read_bytes()
+            with patch("telegram_caption_downloader_gui.shutil.copy2", side_effect=OSError("test copy failure")):
+                with self.assertRaises(OSError):
+                    migrate_legacy_account(root)
+            self.assertEqual((root / "credentials.bin").read_bytes(), before)
             self.assertFalse((root / "accounts.json").exists())
+            self.assertEqual(list((root / "accounts").glob("*")), [])
 
     def test_legacy_sqlite_session_is_migrated_to_encrypted_string(self):
         from telethon.crypto import AuthKey
         from telethon.sessions import SQLiteSession, StringSession
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            session = account_directory(root, "legacy") / "account"
+            folder = account_directory(root, "1" * 32)
+            folder.mkdir(parents=True)
+            session = folder / "account"
             old = SQLiteSession(str(session))
             old.set_dc(2, "149.154.167.51", 443)
             old.auth_key = AuthKey(bytes(range(256)))
@@ -371,15 +524,15 @@ class CoreLogicTests(unittest.TestCase):
             old.close()
             migrated = load_account_session(session, lambda _text: None)
             self.assertEqual(migrated.save(), expected)
-            self.assertEqual(load_session_string(session_blob_path(root)), expected)
-            self.assertTrue((root / "account.session").is_file())
+            self.assertEqual(load_session_string(session_blob_path(folder)), expected)
+            self.assertTrue((folder / "account.session").is_file())
 
     def test_private_group_settings_roundtrip_and_clear(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = load_group_settings(root)
             save_group_profile(root, settings, "", "私密群", "",
-                               chat_id=-1004401898428, bound_account_id="legacy")
+                               chat_id=-1004401898428, bound_account_id="1" * 32)
             reloaded = load_group_settings(root)
             self.assertEqual(reloaded["groups"], [{
                 "name": "私密群",
@@ -387,7 +540,7 @@ class CoreLogicTests(unittest.TestCase):
                 "start_time": "00:00",
                 "end_time": "23:59",
                 "chat_id": -1004401898428,
-                "bound_account_id": "legacy",
+                "bound_account_id": "1" * 32,
             }])
             save_group_profile(root, reloaded, "私密群", "公开群", "https://t.me/example")
             again = load_group_settings(root)
@@ -400,7 +553,7 @@ class CoreLogicTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 save_group_profile(root, again, "", "私密二", "", chat_id=-1001)
             with self.assertRaises(ValueError):
-                save_group_profile(root, again, "", "私密三", "", chat_id=1001, bound_account_id="legacy")
+                save_group_profile(root, again, "", "私密三", "", chat_id=1001, bound_account_id="1" * 32)
 
     def test_group_notes_support_per_link_exclusive_lists(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -502,18 +655,49 @@ class CoreLogicTests(unittest.TestCase):
     def test_accounts_use_separate_sessions_and_encrypted_credentials_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            save_saved_credentials(root / "credentials.bin", 123, "old-hash", "+8613800000000")
+            first = create_account_profile(root, "第一个号", 123, "old-hash", "+8613800000000")
             new = create_account_profile(root, "第二个号", 456, "new-secret", "+8613900000000")
-            self.assertNotEqual(account_directory(root, new["id"]), root)
+            self.assertNotEqual(account_directory(root, new["id"]), account_directory(root, first["id"]))
             self.assertEqual(load_saved_credentials(account_directory(root, new["id"]) / "credentials.bin"),
                              (456, "new-secret", "+8613900000000"))
-            self.assertEqual(load_saved_credentials(root / "credentials.bin"), (123, "old-hash", "+8613800000000"))
+            self.assertEqual(load_saved_credentials(account_directory(root, first["id"]) / "credentials.bin"),
+                             (123, "old-hash", "+8613800000000"))
             manifest = (root / "accounts.json").read_text(encoding="utf-8")
             self.assertNotIn("new-secret", manifest)
             self.assertNotIn("13900000000", manifest)
             with self.assertRaises(ValueError):
                 create_account_profile(root, "重复", 456, "new-secret", "+86 139-0000-0000")
             self.assertEqual(len(load_account_profiles(root)), 2)
+
+    def test_delete_account_profile_removes_manifest_entry_directory_and_default_selection(self):
+        from telegram_caption_downloader_gui import save_selected_account
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            keep = create_account_profile(root, "保留号", 123, "old-secret", "+8613800000000")
+            new = create_account_profile(root, "待删除号", 456, "new-secret", "+8613900000000")
+            folder = account_directory(root, new["id"])
+            save_session_string(session_blob_path(folder), "session-string")
+            save_selected_account(root, new["id"])
+            delete_account_profile(root, new["id"])
+            self.assertFalse(folder.exists())
+            self.assertEqual([item["id"] for item in load_account_profiles(root)], [keep["id"]])
+            self.assertEqual(load_saved_credentials(account_directory(root, keep["id"]) / "credentials.bin"),
+                             (123, "old-secret", "+8613800000000"))
+            self.assertFalse((root / "account_selection.json").exists())
+
+    def test_delete_account_profile_rejects_missing_and_keeps_files_on_write_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(ValueError):
+                delete_account_profile(root, "1" * 32)
+            new = create_account_profile(root, "待删除号", 456, "new-secret", "+8613900000000")
+            folder = account_directory(root, new["id"])
+            with patch("telegram_caption_downloader_gui.os.replace", side_effect=OSError("test write failure")):
+                with self.assertRaises(OSError):
+                    delete_account_profile(root, new["id"])
+            self.assertTrue(folder.exists())
+            self.assertEqual(load_saved_credentials(folder / "credentials.bin"), (456, "new-secret", "+8613900000000"))
+            self.assertEqual(len(load_account_profiles(root)), 1)
 
     def test_account_profile_rejects_path_traversal_and_corrupt_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -526,7 +710,7 @@ class CoreLogicTests(unittest.TestCase):
                 load_account_profiles(root)
 
     def test_login_verifies_both_telegram_id_and_phone(self):
-        profile = {"id": "legacy", "name": "旧号", "user_id": 7}
+        profile = {"id": "1" * 32, "name": "旧号", "user_id": 7}
         verify_account_user(profile, SimpleNamespace(id=7, phone="8613800000000"), "+8613800000000")
         with self.assertRaises(RuntimeError):
             verify_account_user(profile, SimpleNamespace(id=8, phone="8613800000000"), "+8613800000000")
@@ -1274,9 +1458,15 @@ class GuiFlowTests(unittest.TestCase):
         self.app.api_id.set("12345")
         self.app.api_hash.set("secret-hash")
         self.app.phone.set("+8613800000000")
-        save_saved_credentials(Path(self.app_directory.name) / "credentials.bin", 12345, "secret-hash", "+8613800000000")
+        self.account_id = "0" * 32
+        save_saved_credentials(
+            account_directory(Path(self.app_directory.name), self.account_id) / "credentials.bin",
+            12345, "secret-hash", "+8613800000000",
+        )
+        save_account_profile(Path(self.app_directory.name),
+                             {"id": self.account_id, "name": "测试号", "user_id": 7})
         self.app.refresh_account_profiles()
-        self.app.select_account("legacy")
+        self.app.select_account(self.account_id)
 
     def tearDown(self):
         self.root.update()
@@ -1284,7 +1474,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.2.9")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.2")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -1293,6 +1483,274 @@ class GuiFlowTests(unittest.TestCase):
         self.app.api_id.set("not-a-number")
         with self.assertRaises(ValueError):
             self.app.credentials()
+
+    def test_auto_capture_page_is_reachable_from_account_settings_and_saves_group_rule(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "自动群", "@auto")
+        self.app.reload_group_profiles("自动群")
+        self.app.open_login_settings()
+        self.root.update()
+        self.assertTrue(self.app.auto_capture_button.winfo_exists())
+        self.app.open_auto_capture_settings()
+        self.root.update()
+        dialog = self.app.auto_capture_settings_dialog
+        self.assertEqual(dialog.window.title(), "自动抓取设置")
+        item_id = dialog.tree.get_children()[0]
+        dialog.tree.selection_set(item_id)
+        self.root.update()
+        dialog.enabled.set(True)
+        dialog.first_time.set("18:00")
+        dialog.second_time.set("22:30")
+        dialog.min_images.set("1000")
+        dialog.save_item()
+        saved = load_group_settings(self.app.program_root)["groups"][0]["auto_capture"]
+        self.assertTrue(saved["enabled"])
+        self.assertEqual(saved["first_time"], "18:00")
+        self.assertEqual(saved["second_time"], "22:30")
+        self.assertEqual(saved["min_images"], 1000)
+        self.app.auto_capture_settings_dialog.window.destroy()
+        self.app.login_settings_window.destroy()
+
+    def test_delete_account_button_removes_selected_account_after_confirmation(self):
+        app_data = Path(self.app_directory.name)
+        new = create_account_profile(app_data, "待删除号", 456, "new-secret", "+8613900000000")
+        folder = account_directory(app_data, new["id"])
+        self.app.open_login_settings()
+        self.app.select_account(new["id"])
+        self.root.update()
+        self.assertTrue(self.app.delete_account_button.winfo_exists())
+        self.assertEqual(str(self.app.delete_account_button.cget("state")), "normal")
+        with patch("telegram_caption_downloader_gui.messagebox.askyesno", return_value=True) as confirm:
+            self.app.delete_account()
+        self.root.update()
+        confirm.assert_called_once()
+        self.assertFalse(folder.exists())
+        self.assertEqual([profile["id"] for profile in self.app.account_profiles], [self.account_id])
+        self.assertEqual(self.app.selected_account_id, "")
+        self.assertEqual(str(self.app.delete_account_button.cget("state")), "disabled")
+        self.app.login_settings_window.destroy()
+
+    def test_delete_account_is_blocked_for_the_logged_in_account(self):
+        app_data = Path(self.app_directory.name)
+        new = create_account_profile(app_data, "待删除号", 456, "new-secret", "+8613900000000")
+        folder = account_directory(app_data, new["id"])
+        self.app.open_login_settings()
+        self.app.select_account(new["id"])
+        self.app.logged_in = True
+        self.app.active_account_id = new["id"]
+        self.root.update()
+        with patch("telegram_caption_downloader_gui.messagebox.showwarning") as warn:
+            self.app.delete_account()
+        self.root.update()
+        warn.assert_called_once()
+        self.assertTrue(folder.exists())
+        self.assertEqual(len(self.app.account_profiles), 2)
+        self.app.login_settings_window.destroy()
+
+    def test_auto_capture_scheduler_records_first_attempt_and_dispatches_group(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "自动群", "@auto")
+        self.app.reload_group_profiles("自动群")
+        self.app.settings["groups"][0]["auto_capture"] = normalize_auto_capture_settings({
+            "enabled": True, "first_time": "18:00", "second_time": "22:30", "min_images": 1000,
+        })
+        self.app.logged_in = True
+        self.app.selected_account_id = self.app.active_account_id = self.account_id
+        self.app.active_user_id = 7
+        with patch.object(self.app, "start_download") as start_download:
+            self.app._check_auto_capture_schedule(datetime(2026, 10, 3, 18, 0, tzinfo=timezone(timedelta(hours=8))))
+        start_download.assert_called_once_with(
+            group_name_override="自动群", target_day_override=date(2026, 10, 3), auto_attempt=1, auto_min_images=1000,
+        )
+        self.assertEqual(self.app.settings["groups"][0]["auto_capture"]["first_attempt_date"], "2026-10-03")
+
+    def test_auto_capture_scheduler_skips_group_recorded_in_manual_capture_json_log(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "自动群", "@auto")
+        self.app.reload_group_profiles("自动群")
+        profile = self.app.settings["groups"][0]
+        profile["auto_capture"] = normalize_auto_capture_settings({
+            "enabled": True, "first_time": "18:00", "second_time": "22:30", "min_images": 1000,
+        })
+        today = datetime.now(gui.CN_TZ).date()
+        record_manual_capture(manual_capture_log_path(self.app.status_root), "自动群", today)
+        self.app.logged_in = True
+        self.app.selected_account_id = self.app.active_account_id = self.account_id
+        self.app.active_user_id = 7
+        with patch.object(self.app, "start_download") as start_download:
+            self.app._check_auto_capture_schedule(
+                datetime(today.year, today.month, today.day, 18, 0, tzinfo=gui.CN_TZ)
+            )
+        start_download.assert_not_called()
+        self.assertEqual(profile["auto_capture"]["first_attempt_date"], "")
+        profile["auto_capture"]["first_attempt_date"] = today.isoformat()
+        gui.save_auto_capture_settings(self.app.program_root, self.app.settings, profile, profile["auto_capture"])
+        self.app.settings = load_group_settings(self.app.program_root)
+        second_time = datetime(today.year, today.month, today.day, 22, 30, tzinfo=gui.CN_TZ)
+        with patch.object(self.app, "_begin_auto_capture") as begin:
+            self.app._check_auto_capture_schedule(second_time)
+            begin.assert_not_called()
+            self.app._check_auto_capture_schedule(second_time + timedelta(days=1))
+            self.assertEqual(begin.call_count, 1)
+            self.assertEqual(begin.call_args.args[2:], (1, today + timedelta(days=1)))
+
+    def test_auto_capture_keeps_manual_skip_when_expired_log_cleanup_cannot_write(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "自动群", "@auto")
+        self.app.reload_group_profiles("自动群")
+        self.app.settings["groups"][0]["auto_capture"] = normalize_auto_capture_settings(dict(
+            enabled=True, first_time="18:00", second_time="22:30", min_images=1000,
+        ))
+        today = datetime.now(gui.CN_TZ).date()
+        path = manual_capture_log_path(self.app.status_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"days": {
+            today.isoformat(): ["自动群"],
+            (today - timedelta(days=7)).isoformat(): ["旧群"],
+        }}, ensure_ascii=False), encoding="utf-8")
+        original = path.read_bytes()
+        self.app.logged_in = True
+        self.app.selected_account_id = self.app.active_account_id = self.account_id
+        with patch.object(gui.os, "replace", side_effect=PermissionError("locked")), \
+             patch.object(self.app, "_begin_auto_capture") as begin, \
+             patch.object(self.app, "log") as log:
+            self.app._check_auto_capture_schedule(datetime(today.year, today.month, today.day, 18, tzinfo=gui.CN_TZ))
+            begin.assert_not_called()
+            self.assertTrue(any("过期记录清理失败" in call.args[0] for call in log.call_args_list))
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_auto_capture_rule_edit_preserves_today_attempts_and_failed_save_rolls_back(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "自动群", "@auto")
+        self.app.reload_group_profiles("自动群")
+        profile = self.app.settings["groups"][0]
+        profile["auto_capture"] = normalize_auto_capture_settings({
+            "enabled": True, "first_time": "18:00", "second_time": "22:00", "min_images": 1000,
+            "first_attempt_date": "2026-10-03", "second_attempt_date": "2026-10-03",
+            "last_discovered_date": "2026-10-03", "last_discovered_images": 193,
+        })
+        self.app.open_auto_capture_settings()
+        self.root.update()
+        dialog = self.app.auto_capture_settings_dialog
+        dialog.min_images.set("900")
+        dialog.save_item()
+        saved = load_group_settings(self.app.program_root)["groups"][0]["auto_capture"]
+        self.assertEqual(saved["first_attempt_date"], "2026-10-03")
+        self.assertEqual(saved["second_attempt_date"], "2026-10-03")
+        self.assertEqual(saved["last_discovered_images"], 193)
+        self.root.update()
+        dialog.min_images.set("800")
+        before = dict(profile["auto_capture"])
+        with patch("telegram_caption_downloader_gui._write_group_settings", side_effect=OSError("disk full")), \
+             patch("telegram_caption_downloader_gui.messagebox.showwarning"):
+            dialog.save_item()
+        self.assertEqual(profile["auto_capture"], before)
+        self.app.set_busy(True)
+        dialog.min_images.set("700")
+        dialog.save_item()
+        self.assertEqual(profile["auto_capture"], before)
+        self.app.set_busy(False)
+
+    def test_auto_capture_scheduler_skips_busy_unlogged_and_workflow_runs(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "自动群", "@auto")
+        self.app.settings["groups"][0]["auto_capture"] = normalize_auto_capture_settings({
+            "enabled": True, "first_time": "18:00", "second_time": "22:00", "min_images": 1000,
+        })
+        now = datetime(2026, 10, 3, 18, 0, tzinfo=timezone(timedelta(hours=8)))
+        with patch.object(self.app, "start_download") as worker:
+            self.app._check_auto_capture_schedule(now)
+            self.app.logged_in = True
+            self.app.selected_account_id = self.app.active_account_id = self.account_id
+            self.app._busy = True
+            self.app._check_auto_capture_schedule(now)
+            self.app._busy = False
+            self.app._workflow_mode = True
+            self.app._check_auto_capture_schedule(now)
+        worker.assert_not_called()
+        self.assertEqual(self.app.settings["groups"][0]["auto_capture"]["first_attempt_date"], "")
+        self.app._workflow_mode = False
+
+    def test_auto_capture_threshold_blocks_extraction_before_writing_results(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "阈值群", "@threshold")
+        self.app.reload_group_profiles("阈值群")
+        (self.app.program_root / "群配置" / "阈值群.json").write_text(
+            '{"keywords":["战狼"]}', encoding="utf-8"
+        )
+        self.app.output_path.set(str(root / "results"))
+        self.app.logged_in = True
+        self.app.selected_account_id = self.app.active_account_id = self.account_id
+        self.app.active_user_id = 7
+
+        message = SimpleNamespace(
+            id=1,
+            raw_text="战狼",
+            grouped_id=None,
+            date=datetime(2026, 10, 3, 4, 0, tzinfo=timezone.utc),
+            file=SimpleNamespace(mime_type="image/jpeg", ext=".jpg"),
+            photo=True,
+        )
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter([message])
+
+        results = []
+        self.app.run_worker = lambda operation, success, on_failure=None: results.append(operation())
+        with patch("telethon.sync.TelegramClient", Client):
+            self.app.start_download(
+                group_name_override="阈值群",
+                target_day_override=date(2026, 10, 3),
+                auto_attempt=1,
+                auto_min_images=2,
+            )
+        self.app._busy = False
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].threshold_blocked)
+        self.assertEqual(results[0].discovered_images, 1)
+        self.assertFalse((root / "results" / "10.3-阈值群").exists())
+        self.assertFalse(capture_status_path(self.app.status_root, "阈值群").exists())
+
+    def test_auto_capture_retries_once_after_low_first_count_and_stops_after_pass(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "两次群", "@twice")
+        self.app.reload_group_profiles("两次群")
+        profile = self.app.settings["groups"][0]
+        profile["auto_capture"] = normalize_auto_capture_settings({
+            "enabled": True, "first_time": "18:00", "second_time": "22:00", "min_images": 1000,
+        })
+        self.app.logged_in = True
+        self.app.selected_account_id = self.app.active_account_id = self.account_id
+        calls = []
+        self.app.start_download = lambda **kwargs: calls.append(kwargs)
+        tz = timezone(timedelta(hours=8))
+        first_now = datetime(2026, 10, 3, 18, 0, tzinfo=tz)
+        second_now = datetime(2026, 10, 3, 22, 0, tzinfo=tz)
+        self.app._check_auto_capture_schedule(first_now)
+        self.assertEqual(calls[0]["auto_attempt"], 1)
+        self.app._finish_auto_capture(SimpleNamespace(discovered_images=193, threshold_blocked=True))
+        self.app._check_auto_capture_schedule(second_now)
+        self.assertEqual(calls[1]["auto_attempt"], 2)
+        self.app._finish_auto_capture(SimpleNamespace(
+            discovered_images=1035, threshold_blocked=False, failed_images=0, unmatched=0, downloaded=1035,
+        ))
+        self.app._check_auto_capture_schedule(datetime(2026, 10, 3, 23, 0, tzinfo=tz))
+        self.assertEqual(len(calls), 2)
+        saved = load_group_settings(self.app.program_root)["groups"][0]["auto_capture"]
+        self.assertEqual(saved["last_discovered_images"], 1035)
+        self.assertEqual(saved["captured_date"], "2026-10-03")
 
     def test_thread_stack_dump_reports_every_thread(self):
         dump = thread_stack_dump()
@@ -1461,7 +1919,7 @@ class GuiFlowTests(unittest.TestCase):
                 return iter(messages_by_source[entity])
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with (
             patch("telethon.sync.TelegramClient", Client),
             patch("telegram_caption_downloader_gui.messagebox.showinfo"),
@@ -1472,9 +1930,9 @@ class GuiFlowTests(unittest.TestCase):
         self.assertEqual(len(list((group_dir / "综合").glob("*.jpg"))), 1)
         status = load_capture_status(capture_status_path(self.app.status_root, "测试群"))
         self.assertEqual(status["remarks"]["战狼"]["status"], "已完成")
-        self.assertEqual(status["remarks"]["战狼"]["image_message_ids"], [1000])
+        self.assertEqual(status["remarks"]["战狼"]["image_messages"], [{"source": "@a", "id": 1000}])
         self.assertEqual(status["remarks"]["综合"]["status"], "已完成")
-        self.assertEqual(status["remarks"]["综合"]["image_message_ids"], [1000])
+        self.assertEqual(status["remarks"]["综合"]["image_messages"], [{"source": "@b", "id": 1000}])
         self.assertEqual((group_dir / "未匹配备注.txt").read_text(encoding="utf-8-sig"), "")
 
     def test_group_list_click_switches_group_via_real_event(self):
@@ -1991,7 +2449,7 @@ class GuiFlowTests(unittest.TestCase):
         self.assertTrue(self.app.logged_in)
         self.assertEqual(self.app.account_status.get(), "已登录：测试账号")
         self.assertEqual(
-            load_saved_credentials(Path(self.app_directory.name) / "credentials.bin"),
+            load_saved_credentials(account_directory(Path(self.app_directory.name), self.account_id) / "credentials.bin"),
             (12345, "secret-hash", "+8613800000000"),
         )
 
@@ -2021,7 +2479,7 @@ class GuiFlowTests(unittest.TestCase):
             self.assertGreaterEqual(dialog.winfo_rooty(), 0)
             self.assertIsNone(second_root.grab_current(), "账号弹窗不应锁住主窗口的关闭操作")
             self.assertEqual(second_app.api_id.get(), "")
-            second_app.select_account("legacy")
+            second_app.select_account(second_app.account_profiles[0]["id"])
             self.assertEqual(second_app.api_id.get(), "9876")
             self.assertEqual(second_app.api_hash.get(), "saved-hash")
             self.assertEqual(second_app.phone.get(), "+8613900000000")
@@ -2035,7 +2493,7 @@ class GuiFlowTests(unittest.TestCase):
         app_data = Path(self.app_directory.name)
         second = create_account_profile(app_data, "备用号", 678, "other-secret", "+8613900000000")
         self.app.refresh_account_profiles()
-        for account_id, user_id, phone in [("legacy", 7, "8613800000000"),
+        for account_id, user_id, phone in [(self.account_id, 7, "8613800000000"),
                                            (second["id"], 8, "8613900000000")]:
             self.app.select_account(account_id)
             session = account_directory(app_data, account_id) / "session.bin"
@@ -2073,7 +2531,7 @@ class GuiFlowTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from telegram_caption_downloader_gui import load_selected_account
         root = Path(self.app_directory.name)
-        session = root / "session.bin"
+        session = account_directory(root, self.account_id) / "session.bin"
         save_session_string(session, fake_session_string())
         original_session = session.read_bytes()
         client = MagicMock()
@@ -2085,8 +2543,8 @@ class GuiFlowTests(unittest.TestCase):
         client.send_code_request.assert_not_called()
         client.sign_in.assert_not_called()
         self.assertFalse(self.app.logged_in)
-        self.assertEqual(self.app.selected_account_id, "legacy")
-        self.assertEqual(load_selected_account(root), "legacy")
+        self.assertEqual(self.app.selected_account_id, self.account_id)
+        self.assertEqual(load_selected_account(root), self.account_id)
         self.assertEqual(session.read_bytes(), original_session)
 
     def test_invalid_saved_choice_prompts_without_fallback_or_overwrite(self):
@@ -2109,9 +2567,10 @@ class GuiFlowTests(unittest.TestCase):
             client.assert_not_called()
             warning.assert_called_once()
             self.assertFalse(self.app.logged_in)
-            self.assertEqual(self.app.selected_account_id, "legacy")
+            self.assertEqual(self.app.selected_account_id, self.account_id)
         self.app.select_account("")
-        before = (app_data / "credentials.bin").read_bytes()
+        credentials = account_directory(app_data, self.account_id) / "credentials.bin"
+        before = credentials.read_bytes()
         with (patch("telegram_caption_downloader_gui.load_saved_credentials", return_value=None),
               patch("telegram_caption_downloader_gui.messagebox.showwarning"),
               patch("telethon.sync.TelegramClient") as client):
@@ -2119,8 +2578,8 @@ class GuiFlowTests(unittest.TestCase):
             client.assert_not_called()
             self.assertTrue(self.app.login_settings_window.winfo_exists())
             self.assertEqual(self.app.selected_account_id, "")
-        self.assertEqual(load_selected_account(app_data), "legacy")
-        self.assertEqual((app_data / "credentials.bin").read_bytes(), before)
+        self.assertEqual(load_selected_account(app_data), self.account_id)
+        self.assertEqual(credentials.read_bytes(), before)
 
     def test_new_install_dialog_allows_typing_and_closing_without_login(self):
         root = Tk()
@@ -2146,7 +2605,7 @@ class GuiFlowTests(unittest.TestCase):
         new = create_account_profile(Path(self.app_directory.name), "第二个号", 678, "other-hash", "+8613900000000")
         original = (self.app.settings, self.app.status_root, self.app.log_root, self.app.output_path.get(), self.app.chat.get())
         self.app.logged_in = True
-        self.app.active_account_id = "legacy"
+        self.app.active_account_id = self.account_id
         self.app.refresh_account_profiles()
         self.app.select_account(new["id"])
         self.assertFalse(self.app.logged_in)
@@ -2165,7 +2624,7 @@ class GuiFlowTests(unittest.TestCase):
         with patch.object(self.app, "run_worker") as worker:
             self.app.login()
             worker.assert_not_called()
-        self.assertEqual(self.app.selected_account_id, "legacy")
+        self.assertEqual(self.app.selected_account_id, self.account_id)
         self.assertEqual(str(self.app.account_combo.cget("state")), "disabled")
         self.app.set_busy(False)
         self.assertEqual(str(self.app.account_combo.cget("state")), "readonly")
@@ -2176,7 +2635,7 @@ class GuiFlowTests(unittest.TestCase):
         client.is_user_authorized.return_value = True
         client.get_me.return_value = SimpleNamespace(first_name="wrong", id=8, phone="8613900000000")
         self.app.logged_in = True
-        self.app.active_account_id = "legacy"
+        self.app.active_account_id = self.account_id
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
         with patch("telethon.sync.TelegramClient", return_value=client):
             with self.assertRaises(RuntimeError):
@@ -2190,8 +2649,9 @@ class GuiFlowTests(unittest.TestCase):
         from telethon.errors import SessionPasswordNeededError
         from telethon.sessions import StringSession
         root = Path(self.app_directory.name)
-        old_credentials = (root / "credentials.bin").read_bytes()
-        (root / "account.session").write_bytes(b"old session, must not move")
+        folder = account_directory(root, self.account_id)
+        old_credentials = (folder / "credentials.bin").read_bytes()
+        (folder / "account.session").write_bytes(b"old session, must not move")
         self.app.open_login_settings()
         self.app.begin_add_account()
         self.assertEqual(self.app.api_hash.get(), "")
@@ -2213,13 +2673,13 @@ class GuiFlowTests(unittest.TestCase):
         new_id = self.app.active_account_id
         self.assertEqual(load_selected_account(root), new_id)
         self.assertTrue(self.app.logged_in)
-        self.assertNotEqual(new_id, "legacy")
+        self.assertNotEqual(new_id, self.account_id)
         self.assertIsInstance(factory.call_args.args[0], StringSession)
         self.assertEqual(ask.call_count, 2)
         client.send_code_request.assert_called_once_with("+8613900000000")
         client.sign_in.assert_any_call(password="secret-password")
-        self.assertEqual((root / "credentials.bin").read_bytes(), old_credentials)
-        self.assertEqual((root / "account.session").read_bytes(), b"old session, must not move")
+        self.assertEqual((folder / "credentials.bin").read_bytes(), old_credentials)
+        self.assertEqual((folder / "account.session").read_bytes(), b"old session, must not move")
         self.assertEqual(len(load_account_profiles(root)), 2)
         all_logs = "\n".join(path.read_text(encoding="utf-8") for path in self.app.log_root.rglob("*.log"))
         for secret in ("123456", "secret-password", "new-secret", "13900000000"):
@@ -2262,7 +2722,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app.day.set("2026-09-02")
         sessions = []
         first_session, second_session = fake_session_string(1), fake_session_string(2)
-        save_session_string(account_directory(root, "legacy") / "session.bin", first_session)
+        save_session_string(account_directory(root, self.account_id) / "session.bin", first_session)
         save_session_string(account_directory(root, second["id"]) / "session.bin", second_session)
 
         class Message:
@@ -2299,7 +2759,7 @@ class GuiFlowTests(unittest.TestCase):
                 return iter([Message()])
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
             self.app.start_download()
             status_path = capture_status_path(self.app.status_root, "共享群")
@@ -2356,12 +2816,12 @@ class GuiFlowTests(unittest.TestCase):
                 return iter(())
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
             self.app.start_download()
         self.assertEqual([session.save() for session in sessions], [second_session])
         self.assertTrue(self.app.logged_in)
-        self.assertEqual(self.app.active_account_id, "legacy")
+        self.assertEqual(self.app.active_account_id, self.account_id)
         logs = "\n".join(path.read_text(encoding="utf-8") for path in self.app.log_root.rglob("*.log"))
         self.assertIn("本次私密群抓取使用", logs)
         self.assertIn("-1004401898428", logs)
@@ -2374,14 +2834,14 @@ class GuiFlowTests(unittest.TestCase):
         self.app.refresh_account_profiles()
         self.app.reload_group_profiles("慕熙会员群")
         self.app.day.set("2026-09-02")
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with patch("telethon.sync.TelegramClient") as factory, \
              patch("telegram_caption_downloader_gui.messagebox.showwarning") as warning:
             self.app.start_download()
         factory.assert_not_called()
         warning.assert_called_once()
         self.assertTrue(self.app.logged_in)
-        self.assertEqual(self.app.active_account_id, "legacy")
+        self.assertEqual(self.app.active_account_id, self.account_id)
 
     def test_private_group_expired_bound_session_does_not_clear_current_login(self):
         root = Path(self.app_directory.name)
@@ -2409,13 +2869,13 @@ class GuiFlowTests(unittest.TestCase):
                 return False
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with patch("telethon.sync.TelegramClient", ExpiredClient), \
              patch("telegram_caption_downloader_gui.messagebox.showinfo"):
             with self.assertRaisesRegex(RuntimeError, "登录已失效"):
                 self.app.start_download()
         self.assertTrue(self.app.logged_in)
-        self.assertEqual(self.app.active_account_id, "legacy")
+        self.assertEqual(self.app.active_account_id, self.account_id)
 
     def test_public_group_still_requires_current_account_login(self):
         save_group_profile(self.app.program_root, self.app.settings, "", "公开测试群", "@public")
@@ -2466,7 +2926,8 @@ class GuiFlowTests(unittest.TestCase):
         status_path.write_text(json.dumps({
             "group_name": "测试群",
             "date": "2026-09-02",
-            "remarks": {"九肖统计": {"status": "待处理", "pending_message_ids": [3]}},
+            "remarks": {"九肖统计": {"status": "待处理",
+                                     "pending_messages": [{"source": "@old", "id": 3}]}},
             "last_message_ids": {"@old": 5},
         }, ensure_ascii=False), encoding="utf-8")
 
@@ -2511,7 +2972,7 @@ class GuiFlowTests(unittest.TestCase):
                 return stream()
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
             self.app.start_download(retry=True)
         self.assertIn(1, consumed)
@@ -2559,7 +3020,7 @@ class GuiFlowTests(unittest.TestCase):
                 return iter([Message()])
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
             self.app.start_download()
             self.assertFalse((root / "results" / "9.2-嫣然心水" / "阿尔法天狼星").exists())
@@ -2630,7 +3091,7 @@ class GuiFlowTests(unittest.TestCase):
                 return [next((message for message in messages if message.id == item), None) for item in ids]
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         status_path = capture_status_path(self.app.status_root, "黄大仙新澳")
         group_output = root / "results" / "9.2-黄大仙新澳"
         with (
@@ -2650,7 +3111,7 @@ class GuiFlowTests(unittest.TestCase):
             self.assertTrue(self.app.task_status.get().startswith("完成："))
             status = load_capture_status(status_path)
             self.assertEqual(status["remarks"]["战狼"]["status"], "已完成")
-            self.assertEqual(status["remarks"]["战狼"]["pending_message_ids"], [])
+            self.assertEqual(status["remarks"]["战狼"]["pending_messages"], [])
             self.assertEqual((group_output / "未匹配备注.txt").read_text(encoding="utf-8-sig"), "")
 
             for pending, remaining in [([2], []), ([2, 3, 4], [3, 4])]:
@@ -2659,7 +3120,8 @@ class GuiFlowTests(unittest.TestCase):
                     save_capture_status(status_path, status)
                     self.app.start_download(retry=True)
                     actual = load_capture_status(status_path)["remarks"]["战狼"]
-                    self.assertEqual(actual["pending_message_ids"], remaining)
+                    self.assertEqual(actual["pending_messages"],
+                                     [{"source": "@huang", "id": item} for item in remaining])
                     self.assertEqual(actual["image_count"], 1)
                     self.assertEqual(actual["status"], "部分完成" if remaining else "已完成")
                     self.assertEqual((group_output / "未匹配备注.txt").read_text(encoding="utf-8-sig"),
@@ -2670,7 +3132,8 @@ class GuiFlowTests(unittest.TestCase):
                 with self.assertRaises(OcrError):
                     self.app.start_download()
             failed = load_capture_status(status_path)["remarks"]["战狼"]
-            self.assertEqual(failed["pending_message_ids"], [3, 4])
+            self.assertEqual(failed["pending_messages"],
+                             [{"source": "@huang", "id": 3}, {"source": "@huang", "id": 4}])
             self.assertEqual(failed["image_count"], 1)
             self.assertEqual(failed["status"], "部分完成")
             preview_updates = [(current, total) for current, total, status in progress_updates
@@ -2760,7 +3223,7 @@ class GuiFlowTests(unittest.TestCase):
             return {"天机阁杀料"} if payload in {payloads[7], payloads[15]} else set()
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with (
             patch("telethon.sync.TelegramClient", Client),
             patch("telegram_caption_downloader_gui.messagebox.showinfo"),
@@ -2779,7 +3242,8 @@ class GuiFlowTests(unittest.TestCase):
         output = root / "results" / "9.2-嫣然心水" / "天机阁杀料"
         self.assertEqual(len(list(output.glob("*.jpg"))), 12)
         status = load_capture_status(capture_status_path(self.app.status_root, "嫣然心水"))
-        self.assertEqual(status["remarks"]["天机阁杀料"]["image_message_ids"], list(range(5, 17)))
+        self.assertEqual(status["remarks"]["天机阁杀料"]["image_messages"],
+                         [{"source": "@yanran", "id": item} for item in range(5, 17)])
 
     def test_yanran_guaiguai_flow_extends_similar_groups_two_steps(self):
         root = Path(self.app_directory.name)
@@ -2843,7 +3307,7 @@ class GuiFlowTests(unittest.TestCase):
                 return iter(messages)
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with (
             patch("telethon.sync.TelegramClient", Client),
             patch("telegram_caption_downloader_gui.messagebox.showinfo"),
@@ -2909,7 +3373,7 @@ class GuiFlowTests(unittest.TestCase):
             return {"实力双波"} if payload == b"unwanted-cover" else set()
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with (
             patch("telethon.sync.TelegramClient", Client),
             patch("telegram_caption_downloader_gui.messagebox.showinfo"),
@@ -2921,7 +3385,8 @@ class GuiFlowTests(unittest.TestCase):
         self.assertEqual(len(list((output / "斩杀系列").glob("*.jpg"))), 2)
         status = load_capture_status(capture_status_path(self.app.status_root, "新澳高手"))
         self.assertEqual(status["remarks"]["斩杀系列"]["status"], "已完成")
-        self.assertEqual(status["remarks"]["斩杀系列"]["image_message_ids"], [3, 4])
+        self.assertEqual(status["remarks"]["斩杀系列"]["image_messages"],
+                         [{"source": "@expert", "id": 3}, {"source": "@expert", "id": 4}])
         self.assertEqual((output / "未匹配备注.txt").read_text(encoding="utf-8-sig"), "")
         logs = "\n".join(path.read_text(encoding="utf-8") for path in self.app.log_root.rglob("*.log"))
         self.assertIn("实力双波", logs)
@@ -2979,7 +3444,7 @@ class GuiFlowTests(unittest.TestCase):
                 return iter(messages)
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with (
             patch("telethon.sync.TelegramClient", Client),
             patch("telegram_caption_downloader_gui.messagebox.showinfo"),
@@ -3051,7 +3516,7 @@ class GuiFlowTests(unittest.TestCase):
             return {"68"} if payload == b"hit-68" else {"红人馆"} if payload == b"hit-red" else set()
 
         self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
-        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
         with (
             patch("telethon.sync.TelegramClient", Client),
             patch("telegram_caption_downloader_gui.messagebox.showinfo"),
@@ -3067,7 +3532,8 @@ class GuiFlowTests(unittest.TestCase):
         self.assertEqual(len(list((output / "香奈儿").glob("*.jpg"))), 2)
         self.assertEqual(len(list((output / "68").glob("*.jpg"))), 2)
         self.assertEqual(len(list((output / "红人馆").glob("*.jpg"))), 2)
-        self.assertFalse(any(path.name.startswith("20260902_120000_5") for path in output.rglob("*.jpg")))
+        self.assertFalse(any(path.name.startswith(f"20260902_120000_{source_tag('@huang')}_5")
+                             for path in output.rglob("*.jpg")))
 
     def test_exact_match_download_flow_writes_report(self):
         class FakeMessage:
@@ -3158,7 +3624,7 @@ class GuiFlowTests(unittest.TestCase):
             self.app.output_path.set(str(output))
             self.app.day.set("2026-08-29")
             self.app.logged_in = True
-            self.app.active_account_id = "legacy"
+            self.app.active_account_id = self.account_id
             self.app.active_user_id = 7
             progress_updates = []
             self.app.set_progress = lambda current, total, status, **kwargs: progress_updates.append(
@@ -3171,11 +3637,12 @@ class GuiFlowTests(unittest.TestCase):
             ):
                 self.app.start_download()
             group_output = output / "8.29-测试群"
+            tag = source_tag("@test_group")
             self.assertFalse((group_output / "旧结果.txt").exists())
-            self.assertTrue((group_output / "大小姐" / "20260829_120000_10.jpg").exists())
-            self.assertTrue((group_output / "大小姐" / "20260829_120000_11.jpg").exists())
-            self.assertTrue((group_output / "大小姐" / "20260829_120200_13.jpg").exists())
-            self.assertFalse((group_output / "大小姐" / "20260829_130000_12.jpg").exists())
+            self.assertTrue((group_output / "大小姐" / f"20260829_120000_{tag}_10.jpg").exists())
+            self.assertTrue((group_output / "大小姐" / f"20260829_120000_{tag}_11.jpg").exists())
+            self.assertTrue((group_output / "大小姐" / f"20260829_120200_{tag}_13.jpg").exists())
+            self.assertFalse((group_output / "大小姐" / f"20260829_130000_{tag}_12.jpg").exists())
             unmatched_lines = (group_output / "未匹配备注.txt").read_text(encoding="utf-8-sig").splitlines()
             self.assertIn("不存在", unmatched_lines)
             self.assertEqual(unmatched_lines.count("天府统计"), 1)
@@ -3189,7 +3656,7 @@ class GuiFlowTests(unittest.TestCase):
             ]
             self.assertEqual(len(completed_updates), 1)
             self.assertRegex(self.app.task_status.get(), r"^完成：3 / 3｜总耗时 \d{2}:\d{2}(?::\d{2})?$")
-            self.assertEqual(DOWNLOAD_CONCURRENCY, 6)
+            self.assertEqual(DOWNLOAD_CONCURRENCY, 14)
             self.assertEqual(FakeMessage.max_active_downloads, 3)
             events = runtime_log_path(self.app.log_root, datetime.now().date(), "测试群").read_text(encoding="utf-8")
             for category in ("复抓", "状态", "扫描", "识别", "下载", "汇总"):
@@ -3230,6 +3697,942 @@ class GuiFlowTests(unittest.TestCase):
                     self.app.start_download()
             events = runtime_log_path(self.app.log_root, datetime.now().date(), "测试群").read_text(encoding="utf-8")
             self.assertIn("【状态】抓取状态保存失败：", events)
+
+
+    def test_same_message_id_from_two_sources_saves_two_files_without_overwrite(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@a | @b")
+        self.app.reload_group_profiles("测试群")
+        (self.app.program_root / "群配置" / "测试群.json").write_text(
+            '{"keywords":["战狼"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+
+        class Message:
+            grouped_id = None
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+
+            def __init__(self, message_id, caption, payload):
+                self.id, self.raw_text, self.payload = message_id, caption, payload
+
+            async def download_media(self, file):
+                Path(file).write_bytes(self.payload)
+                return file
+
+        messages_by_source = {
+            "@a": [Message(1000, "战狼", b"image-from-a")],
+            "@b": [Message(1000, "战狼", b"image-from-b")],
+        }
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, entity, **_kwargs):
+                return iter(messages_by_source[entity])
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download()
+
+        group_output = root / "results" / "9.2-测试群"
+        file_a = group_output / "战狼" / f"20260902_120000_{source_tag('@a')}_1000.jpg"
+        file_b = group_output / "战狼" / f"20260902_120000_{source_tag('@b')}_1000.jpg"
+        self.assertEqual(len(list((group_output / "战狼").glob("*.jpg"))), 2)
+        self.assertEqual(file_a.read_bytes(), b"image-from-a")
+        self.assertEqual(file_b.read_bytes(), b"image-from-b")
+        status = load_capture_status(capture_status_path(self.app.status_root, "测试群"))
+        self.assertEqual(status["remarks"]["战狼"]["image_count"], 2)
+        self.assertEqual(status["remarks"]["战狼"]["image_messages"],
+                         [{"source": "@a", "id": 1000}, {"source": "@b", "id": 1000}])
+        report_rows = read_report(group_output / "提取报告.csv")
+        self.assertEqual(report_rows[0], ["备注", "来源", "消息ID", "北京时间", "本地文件"])
+        self.assertEqual([row[1] for row in report_rows[1:]], ["@a", "@b"])
+        self.assertEqual([row[2] for row in report_rows[1:]], ["1000", "1000"])
+
+    def test_same_day_retry_queries_each_source_for_its_own_pending_ids(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@a | @b")
+        self.app.reload_group_profiles("测试群")
+        (self.app.program_root / "群配置" / "测试群.json").write_text(
+            '{"keywords":["战狼"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+        (root / "results" / "9.2-测试群").mkdir(parents=True)
+        status_path = capture_status_path(self.app.status_root, "测试群")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(json.dumps({
+            "group_name": "测试群",
+            "date": "2026-09-02",
+            "remarks": {"战狼": {"status": "部分完成", "image_count": 0, "image_messages": [],
+                                "pending_messages": [{"source": "@a", "id": 7},
+                                                     {"source": "@b", "id": 8}]}},
+            "last_message_ids": {"@a": 6, "@b": 7},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        class Message:
+            grouped_id = None
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+
+            def __init__(self, message_id, caption):
+                self.id, self.raw_text = message_id, caption
+
+            async def download_media(self, file):
+                Path(file).write_bytes(f"retry-{self.id}".encode())
+                return file
+
+        messages_by_source = {"@a": [Message(7, "战狼")], "@b": [Message(8, "战狼")]}
+        pending_queries = []
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter([])
+
+            def get_messages(self, entity, ids):
+                pending_queries.append((entity, list(ids)))
+                return [message for message in messages_by_source[entity] if message.id in ids]
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download(retry=True)
+
+        self.assertEqual(pending_queries, [("@a", [7]), ("@b", [8])])
+        group_output = root / "results" / "9.2-测试群" / "战狼"
+        self.assertEqual(len(list(group_output.glob("*.jpg"))), 2)
+        status = load_capture_status(status_path)
+        self.assertEqual(status["remarks"]["战狼"]["image_messages"],
+                         [{"source": "@a", "id": 7}, {"source": "@b", "id": 8}])
+        self.assertEqual(status["remarks"]["战狼"]["pending_messages"], [])
+
+    def test_multi_source_legacy_status_rescans_full_day_and_rewrites_state(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@old | @new")
+        self.app.reload_group_profiles("测试群")
+        (self.app.program_root / "群配置" / "测试群.json").write_text(
+            '{"keywords":["九肖统计"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+        (root / "results" / "9.2-测试群").mkdir(parents=True)
+        status_path = capture_status_path(self.app.status_root, "测试群")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(json.dumps({
+            "group_name": "测试群",
+            "date": "2026-09-02",
+            "remarks": {"九肖统计": {"status": "部分完成", "pending_message_ids": [3]}},
+            "last_message_ids": {"@old": 5},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        pending_queries = []
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter([])
+
+            def get_messages(self, entity, ids):
+                pending_queries.append((entity, list(ids)))
+                return []
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download(retry=True)
+
+        self.assertEqual(pending_queries, [])
+        events = runtime_log_path(self.app.log_root, datetime.now().date(), "测试群").read_text(encoding="utf-8")
+        self.assertIn("状态为旧格式（消息ID未记录来源），多链接群无法判定来源", events)
+        self.assertIn("重新扫描当天消息", events)
+        self.assertNotIn("pending_message_ids", status_path.read_text(encoding="utf-8"))
+        self.assertNotIn("image_message_ids", status_path.read_text(encoding="utf-8"))
+        self.assertEqual(load_capture_status(status_path)["remarks"]["九肖统计"]["pending_messages"], [])
+
+    def test_yanran_guaiguai_preview_failure_aborts_instead_of_silently_skipping(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "嫣然心水", "@yanran")
+        self.app.reload_group_profiles("嫣然心水")
+        (self.app.program_root / "群配置" / "嫣然心水.json").write_text(
+            '{"keywords":["乖乖团队"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+
+        class Message:
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+
+            def __init__(self, message_id, caption, group_id):
+                self.id, self.raw_text, self.grouped_id = message_id, caption, group_id
+
+            async def download_media(self, file):
+                raise OSError("preview download failure")
+
+        messages = [
+            Message(1, "乖乖团队", 10),
+            Message(2, "", 10),
+            Message(3, "", 20),
+        ]
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter(messages)
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            with self.assertRaises(OcrError) as caught:
+                self.app.start_download()
+        self.assertIn("相似度检查图片缺失", str(caught.exception))
+        self.assertIn("本次任务已中止", str(caught.exception))
+        self.assertFalse((root / "results" / "9.2-嫣然心水").exists())
+        self.assertFalse(capture_status_path(self.app.status_root, "嫣然心水").exists())
+        events = runtime_log_path(self.app.log_root, datetime.now().date(), "嫣然心水").read_text(encoding="utf-8")
+        self.assertIn("预览下载失败", events)
+        self.assertNotIn("完成：", events)
+
+
+    def test_legacy_multi_source_state_with_all_completed_migrates_to_source_keys(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@old | @new")
+        self.app.reload_group_profiles("测试群")
+        (self.app.program_root / "群配置" / "测试群.json").write_text(
+            '{"keywords":["九肖统计"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+        (root / "results" / "9.2-测试群").mkdir(parents=True)
+        legacy_file = root / "results" / "9.2-测试群" / "九肖统计" / "20260902_120000_1.jpg"
+        legacy_file.parent.mkdir(parents=True, exist_ok=True)
+        legacy_file.write_bytes(b"legacy-unknown")
+        status_path = capture_status_path(self.app.status_root, "测试群")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        # 所有备注都已完成、且只有旧格式 image_message_ids：旧代码不会重扫，来源与消息ID会丢失。
+        status_path.write_text(json.dumps({
+            "group_name": "测试群",
+            "date": "2026-09-02",
+            "remarks": {"九肖统计": {"status": "已完成", "image_count": 2, "image_message_ids": [1, 2]}},
+            "last_message_ids": {"@old": 5},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        class Message:
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            grouped_id = None
+
+            def __init__(self, message_id, caption):
+                self.id, self.raw_text = message_id, caption
+
+            async def download_media(self, file):
+                Path(file).write_bytes(f"image-{self.id}".encode())
+                return str(file)
+
+        messages_by_source = {"@old": [Message(1, "九肖统计")], "@new": [Message(2, "九肖统计")]}
+        pending_queries = []
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, entity, **_kwargs):
+                return iter(messages_by_source.get(entity, []))
+
+            def get_messages(self, entity, ids):
+                pending_queries.append((entity, list(ids)))
+                return []
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download(retry=True)
+
+        self.assertEqual(pending_queries, [])
+        label_folder = root / "results" / "9.2-测试群" / "九肖统计"
+        files = sorted(path.name for path in label_folder.glob("*.jpg"))
+        self.assertEqual(files, [
+            f"20260902_120000_{source_tag('@old')}_1.jpg",
+            f"20260902_120000_{source_tag('@new')}_2.jpg",
+        ])
+        self.assertEqual((label_folder / files[0]).read_bytes(), b"image-1")
+        self.assertEqual((label_folder / files[1]).read_bytes(), b"image-2")
+        # 旧文件无法判定来源：不归给第一个来源，原样移入 _旧文件未映射。
+        unmapped = (root / "results" / "9.2-测试群" / "_旧文件未映射" / "九肖统计"
+                    / "20260902_120000_1.jpg")
+        self.assertTrue(unmapped.is_file())
+        self.assertEqual(unmapped.read_bytes(), b"legacy-unknown")
+        remark = load_capture_status(status_path)["remarks"]["九肖统计"]
+        self.assertEqual(remark["image_count"], 2)
+        self.assertEqual(
+            {(ref["source"], ref["id"]) for ref in remark["image_messages"]},
+            {("@old", 1), ("@new", 2)},
+        )
+        self.assertEqual(remark["pending_messages"], [])
+        self.assertEqual(remark["status"], "已完成")
+        state_text = status_path.read_text(encoding="utf-8")
+        self.assertNotIn("image_message_ids", state_text)
+        self.assertNotIn("pending_message_ids", state_text)
+        report_rows = read_report(root / "results" / "9.2-测试群" / "提取报告.csv")
+        self.assertEqual(report_rows[0], ["备注", "来源", "消息ID", "北京时间", "本地文件"])
+        self.assertEqual([row[1] for row in report_rows[1:]], ["@old", "@new"])
+        events = runtime_log_path(self.app.log_root, datetime.now().date(), "测试群").read_text(encoding="utf-8")
+        self.assertIn("多链接群无法判定来源", events)
+        self.assertIn("重新扫描当天消息", events)
+
+    def test_same_day_retry_migrates_legacy_filename_without_downloading_again(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@test_group")
+        self.app.reload_group_profiles("测试群")
+        (self.app.program_root / "群配置" / "测试群.json").write_text(
+            '{"keywords":["大小姐"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+        label_folder = root / "results" / "9.2-测试群" / "大小姐"
+        label_folder.mkdir(parents=True)
+        legacy_file = label_folder / "20260902_120000_11.jpg"
+        legacy_file.write_bytes(b"legacy-bytes")
+        status_path = capture_status_path(self.app.status_root, "测试群")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(json.dumps({
+            "group_name": "测试群",
+            "date": "2026-09-02",
+            "remarks": {"大小姐": {
+                "status": "待复抓",
+                "image_count": 1,
+                "image_messages": [{"source": "@test_group", "id": 10}],
+                "pending_messages": [{"source": "@test_group", "id": 11}],
+            }},
+            "last_message_ids": {"@test_group": 10},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        downloads = []
+
+        class Message:
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg", size=12), True
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            grouped_id = None
+
+            def __init__(self, message_id, caption):
+                self.id, self.raw_text = message_id, caption
+
+            async def download_media(self, file):
+                downloads.append(self.id)
+                Path(file).write_bytes(b"downloaded")
+                return str(file)
+
+        pending_messages = [Message(11, "大小姐")]
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter([])
+
+            def get_messages(self, _entity, ids):
+                return [message for message in pending_messages if message.id in ids]
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download(retry=True)
+
+        self.assertEqual(downloads, [])
+        self.assertEqual(sorted(path.name for path in label_folder.glob("*.jpg")), [
+            f"20260902_120000_{source_tag('@test_group')}_11.jpg",
+        ])
+        self.assertFalse(legacy_file.exists())
+        self.assertEqual(next(label_folder.glob("*.jpg")).read_bytes(), b"legacy-bytes")
+        remark = load_capture_status(status_path)["remarks"]["大小姐"]
+        self.assertEqual(
+            {(ref["source"], ref["id"]) for ref in remark["image_messages"]},
+            {("@test_group", 10), ("@test_group", 11)},
+        )
+        self.assertEqual(remark["pending_messages"], [])
+        events = runtime_log_path(self.app.log_root, datetime.now().date(), "测试群").read_text(encoding="utf-8")
+        self.assertIn("旧文件名迁移", events)
+
+    def test_legacy_multi_source_state_counts_only_images_found_this_run(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@old | @new")
+        self.app.reload_group_profiles("测试群")
+        (self.app.program_root / "群配置" / "测试群.json").write_text(
+            '{"keywords":["九肖统计"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+        (root / "results" / "9.2-测试群").mkdir(parents=True)
+        status_path = capture_status_path(self.app.status_root, "测试群")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        # 旧状态声称有过 2 张（纯数字ID），但来源不明；本次只找回 @old 的那一张。
+        status_path.write_text(json.dumps({
+            "group_name": "测试群",
+            "date": "2026-09-02",
+            "remarks": {"九肖统计": {"status": "已完成", "image_count": 2, "image_message_ids": [1, 2]}},
+            "last_message_ids": {"@old": 5},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        class Message:
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            grouped_id = None
+
+            def __init__(self, message_id, caption):
+                self.id, self.raw_text = message_id, caption
+
+            async def download_media(self, file):
+                Path(file).write_bytes(f"image-{self.id}".encode())
+                return str(file)
+
+        messages_by_source = {"@old": [Message(1, "九肖统计")], "@new": [Message(2, "别的内容")]}
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, entity, **_kwargs):
+                return iter(messages_by_source.get(entity, []))
+
+            def get_messages(self, _entity, _ids):
+                return []
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download(retry=True)
+
+        remark = load_capture_status(status_path)["remarks"]["九肖统计"]
+        self.assertEqual(remark["image_count"], 1)
+        self.assertEqual([(ref["source"], ref["id"]) for ref in remark["image_messages"]], [("@old", 1)])
+        label_folder = root / "results" / "9.2-测试群" / "九肖统计"
+        self.assertEqual(sorted(path.name for path in label_folder.glob("*.jpg")),
+                         [f"20260902_120000_{source_tag('@old')}_1.jpg"])
+
+    def test_legacy_multi_source_state_without_found_images_is_not_completed(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@old | @new")
+        self.app.reload_group_profiles("测试群")
+        (self.app.program_root / "群配置" / "测试群.json").write_text(
+            '{"keywords":["九肖统计"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+        (root / "results" / "9.2-测试群").mkdir(parents=True)
+        status_path = capture_status_path(self.app.status_root, "测试群")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(json.dumps({
+            "group_name": "测试群",
+            "date": "2026-09-02",
+            "remarks": {"九肖统计": {"status": "已完成", "image_count": 2, "image_message_ids": [1, 2]}},
+            "last_message_ids": {"@old": 5},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        class Message:
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            grouped_id = None
+
+            def __init__(self, message_id):
+                self.id, self.raw_text = message_id, "无关内容"
+
+            async def download_media(self, file):
+                Path(file).write_bytes(b"unexpected")
+                return str(file)
+
+        messages_by_source = {"@old": [Message(1)], "@new": [Message(2)]}
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, entity, **_kwargs):
+                return iter(messages_by_source.get(entity, []))
+
+            def get_messages(self, _entity, _ids):
+                return []
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download(retry=True)
+
+        remark = load_capture_status(status_path)["remarks"]["九肖统计"]
+        self.assertEqual(remark["image_count"], 0)
+        self.assertEqual(remark["image_messages"], [])
+        self.assertNotEqual(remark["status"], "已完成")
+        self.assertEqual(remark["status"], "未匹配")
+        self.assertFalse((root / "results" / "9.2-测试群" / "九肖统计").exists())
+
+    def test_second_same_day_retry_does_not_append_report_rows(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@test_group")
+        self.app.reload_group_profiles("测试群")
+        (self.app.program_root / "群配置" / "测试群.json").write_text(
+            '{"keywords":["大小姐"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+        (root / "results" / "9.2-测试群").mkdir(parents=True)
+        status_path = capture_status_path(self.app.status_root, "测试群")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def write_pending_state() -> None:
+            status_path.write_text(json.dumps({
+                "group_name": "测试群",
+                "date": "2026-09-02",
+                "remarks": {"大小姐": {"status": "待复抓", "image_count": 0, "image_messages": [],
+                                       "pending_messages": [{"source": "@test_group", "id": 11}]}},
+                "last_message_ids": {"@test_group": 10},
+            }, ensure_ascii=False), encoding="utf-8")
+
+        write_pending_state()
+        downloads = []
+
+        class Message:
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg", size=10), True
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            grouped_id = None
+
+            def __init__(self, message_id, caption):
+                self.id, self.raw_text = message_id, caption
+
+            async def download_media(self, file):
+                downloads.append(self.id)
+                Path(file).write_bytes(b"downloaded")
+                return str(file)
+
+        pending_messages = [Message(11, "大小姐")]
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter([])
+
+            def get_messages(self, _entity, ids):
+                return [message for message in pending_messages if message.id in ids]
+
+        self.app.run_worker = lambda operation, success, on_failure=None: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, self.account_id, 7
+        report_path = root / "results" / "9.2-测试群" / "提取报告.csv"
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download(retry=True)
+            first_rows = read_report(report_path)
+            self.assertEqual(len(first_rows), 2)
+            # 同日再点一次复抓：消息被重新检查，但图片已在磁盘上，报告不得再追加一行。
+            write_pending_state()
+            self.app.start_download(retry=True)
+            second_rows = read_report(report_path)
+
+        self.assertEqual(second_rows, first_rows)
+        self.assertEqual(downloads, [11])
+        self.assertEqual(len(list((root / "results" / "9.2-测试群" / "大小姐").glob("*.jpg"))), 1)
+        events = runtime_log_path(self.app.log_root, datetime.now().date(), "测试群").read_text(encoding="utf-8")
+        self.assertIn("提取报告无新增行", events)
+
+
+class CaptureRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = GuiFlowTests()
+        self.fixture.setUp()
+        self.app = self.fixture.app
+        self.root = self.fixture.root
+        self.account_id = self.fixture.account_id
+        self.day = date(2026, 10, 5)
+
+    def tearDown(self):
+        dialog = getattr(self.app, "auto_capture_settings_dialog", None)
+        if dialog and dialog.window.winfo_exists():
+            dialog._close_window()
+        self.fixture.tearDown()
+
+    def message(self, message_id, *, fail=False, partial=False):
+        message = SimpleNamespace(
+            id=message_id, raw_text="known", grouped_id=None, fail=fail, partial=partial, calls=0,
+            date=datetime(2026, 10, 5, 4, 0, tzinfo=timezone.utc), photo=True,
+            file=SimpleNamespace(mime_type="image/jpeg", ext=".jpg", size=len(b"complete-image")),
+        )
+
+        async def download_media(file):
+            message.calls += 1
+            if message.partial:
+                Path(file).write_bytes(b"partial")
+            if message.fail:
+                raise OSError("simulated disconnected download")
+            Path(file).write_bytes(b"complete-image")
+            return file
+
+        message.download_media = download_media
+        return message
+
+    @contextmanager
+    def capture(self, messages_by_source, keywords):
+        app = self.app
+        save_group_profile(app.program_root, app.settings, "", "Recovery", " | ".join(messages_by_source))
+        gui.write_notes_config(gui.group_notes_path(app.program_root, "Recovery"), keywords)
+        app.reload_group_profiles("Recovery")
+        app.output_path.set(str(Path(self.fixture.app_directory.name) / "results"))
+        app.day.set(self.day.isoformat())
+        app.logged_in = True
+        app.selected_account_id = app.active_account_id = self.account_id
+        app.active_user_id = 7
+        results = []
+
+        class Client:
+            def connect(self): pass
+            def is_user_authorized(self): return True
+            def get_me(self): return SimpleNamespace(id=7, phone="8613800000000")
+            def get_entity(self, address): return address
+            def iter_messages(self, entity, **kwargs):
+                return iter(m for m in messages_by_source[entity] if m.id > kwargs.get("min_id", 0))
+            def get_messages(self, entity, ids):
+                return [m for m in messages_by_source[entity] if m.id in ids]
+
+        @contextmanager
+        def client_context(*_args, **_kwargs):
+            yield Client()
+
+        def run_worker(operation, success, on_failure=None):
+            result = operation()
+            results.append(result)
+            success(result)
+
+        app.run_worker = run_worker
+        with patch.object(gui, "logged_telegram_client", client_context), patch.object(gui.messagebox, "showinfo"):
+            yield results
+
+    def status(self):
+        return load_capture_status(capture_status_path(self.app.status_root, "Recovery"))
+
+    def test_manual_failure_then_successful_retry_records_and_skips_auto_capture(self):
+        self.day = datetime.now(gui.CN_TZ).date()
+        message = self.message(1, fail=True)
+        message.date = datetime(self.day.year, self.day.month, self.day.day, 12, tzinfo=gui.CN_TZ)
+        path = manual_capture_log_path(self.app.status_root)
+        with self.capture({"@a": [message]}, ["known"]):
+            profile = self.app.settings["groups"][0]
+            profile["auto_capture"] = normalize_auto_capture_settings(dict(
+                enabled=True, first_time="18:00", second_time="22:00", min_images=1000,
+            ))
+            self.app.start_download()
+            self.assertFalse(path.exists())
+            with patch.object(self.app, "_begin_auto_capture") as begin:
+                self.app._check_auto_capture_schedule(datetime(self.day.year, self.day.month, self.day.day, 18, tzinfo=gui.CN_TZ))
+                self.assertEqual(begin.call_count, 1)
+            message.fail = False
+            self.app.start_download(retry=True)
+            self.assertEqual(load_manual_capture_log(path, self.day), {self.day.isoformat(): ["Recovery"]})
+            with patch.object(self.app, "_begin_auto_capture") as begin:
+                self.app._check_auto_capture_schedule(datetime(self.day.year, self.day.month, self.day.day, 22, tzinfo=gui.CN_TZ))
+                begin.assert_not_called()
+
+    def test_incomplete_workflow_and_subset_success_do_not_mark_manual_group_complete(self):
+        self.day = datetime.now(gui.CN_TZ).date()
+        path = manual_capture_log_path(self.app.status_root)
+        with self.capture({"@a": []}, ["known"]):
+            for kind in ("unmatched", "failed", "workflow", "subset"):
+                with self.subTest(kind=kind):
+                    self.app._workflow_mode = kind == "workflow"
+                    result = gui.CaptureResult(1, 1, int(kind == "unmatched"), 1, Path("unused"), 1, 1,
+                                               failed_images=int(kind == "failed"))
+                    with patch.object(self.app, "run_worker", side_effect=lambda operation, success, **kw: success(result)), \
+                         patch.object(self.app, "_workflow_finish"):
+                        self.app.start_download(notes_override={"known": "known"} if kind == "subset" else None)
+                        self.root.update()
+                    self.assertFalse(path.exists())
+            self.app._workflow_mode = False
+
+    def test_all_images_retry_recovers_failure_per_source_with_equal_ids(self):
+        first, second = self.message(1, fail=True), self.message(1)
+        with self.capture({"@a": [first], "@b": [second]}, []) as results:
+            self.app.start_download()
+            remark = self.status()["remarks"]["全部图片"]
+            self.assertEqual(remark["pending_messages"], [{"source": "@a", "id": 1}])
+            self.assertEqual(remark["image_messages"], [{"source": "@b", "id": 1}])
+            first.fail = False
+            self.app.start_download(retry=True)
+            self.assertEqual((first.calls, second.calls), (2, 1))
+            self.assertEqual(results[-1].failed_images, 0)
+            self.assertEqual(self.status()["remarks"]["全部图片"]["status"], "已完成")
+
+    def test_old_all_images_status_without_failure_refs_is_reconciled(self):
+        message = self.message(1, fail=True)
+        with self.capture({"@a": [message]}, []):
+            self.app.start_download()
+            status = self.status()
+            status["remarks"] = {}
+            save_capture_status(capture_status_path(self.app.status_root, "Recovery"), status)
+            message.fail = False
+            self.app.start_download(retry=True)
+            self.assertEqual(message.calls, 2)
+            self.assertEqual(self.status()["remarks"]["全部图片"]["image_count"], 1)
+
+    def test_failed_download_never_publishes_partial_and_repairs_old_partial_on_retry(self):
+        message = self.message(1, fail=True, partial=True)
+        with self.capture({"@a": [message]}, ["known"]) as results:
+            self.app.start_download()
+            output = dated_group_output(Path(self.app.output_path.get()), self.day, "Recovery")
+            self.assertEqual(list(output.rglob("*.jpg")), [])
+            self.assertEqual(list(output.rglob("*.part")), [])
+            self.assertEqual(results[-1].failed_images, 1)
+            # Emulate a truncated formal file left by the old version.
+            old = output / "known" / f"20261005_120000_{source_tag('@a')}_1.jpg"
+            old.write_bytes(b"partial")
+            message.fail = message.partial = False
+            self.app.start_download(retry=True)
+            self.assertEqual(message.calls, 2)
+            self.assertEqual(old.read_bytes(), b"complete-image")
+            self.assertEqual(self.status()["remarks"]["known"]["status"], "已完成")
+
+    def test_short_download_return_value_is_not_treated_as_success(self):
+        message = self.message(1)
+        async def short_download(file):
+            Path(file).write_bytes(b"short")
+            return file
+        message.download_media = short_download
+        with self.capture({"@a": [message]}, ["known"]) as results:
+            self.app.start_download()
+            self.assertEqual(results[-1].failed_images, 1)
+            self.assertEqual(results[-1].downloaded, 0)
+            self.assertEqual(self.status()["remarks"]["known"]["status"], "待复抓")
+
+    def test_auto_partial_download_is_not_completed_or_rescanned_after_threshold_met(self):
+        messages = [self.message(1), self.message(2, fail=True)]
+        with self.capture({"@a": messages}, ["known"]):
+            profile = self.app.settings["groups"][0]
+            config = normalize_auto_capture_settings(dict(
+                enabled=True, first_time="18:00", second_time="22:00", min_images=1,
+            ))
+            self.app._begin_auto_capture(profile, config, 1, self.day)
+            self.assertEqual(profile["auto_capture"]["captured_date"], "")
+            self.assertEqual(profile["auto_capture"]["threshold_met_date"], self.day.isoformat())
+            self.assertIn("下载失败 1 张", self.app.task_status.get())
+            self.assertIsNone(auto_capture_due(profile["auto_capture"], datetime(2026, 10, 5, 22, 0)))
+            self.assertEqual(self.status()["remarks"]["known"]["status"], "部分完成")
+
+    def test_bad_notes_preserve_all_groups_and_bad_groups_cannot_be_overwritten(self):
+        for bad_groups in (False, True):
+            with self.subTest(bad_groups=bad_groups):
+                base = Path(self.fixture.app_directory.name) / str(bad_groups)
+                program = base / "program"
+                settings = gui._default_group_settings()
+                save_group_profile(program, settings, "", "Preserve", "@preserve")
+                group_file = program / "群配置" / "groups.json"
+                notes_file = program / "群配置" / "Preserve.json"
+                (group_file if bad_groups else notes_file).write_text('{"broken":', encoding="utf-8")
+                before_group, before_notes = group_file.read_bytes(), notes_file.read_bytes()
+                root = Tk()
+                root.withdraw()
+                try:
+                    app = TelegramDownloaderApp(root, app_data=base / "data", program_root=program,
+                                                status_root=base / "status", show_account_dialog=False)
+                    root.update()
+                    self.assertEqual(group_file.read_bytes(), before_group)
+                    self.assertEqual(notes_file.read_bytes(), before_notes)
+                    if bad_groups:
+                        with self.assertRaises(ValueError):
+                            gui._write_group_settings(program, app.settings)
+                    else:
+                        self.assertEqual(len(app.settings["groups"]), 1)
+                    self.assertIn("读取失败", app.task_status.get())
+                finally:
+                    root.destroy()
+
+    def test_busy_settings_show_reason_keep_draft_and_preserve_threshold_marker(self):
+        with self.capture({"@a": []}, []):
+            profile = self.app.settings["groups"][0]
+            config = normalize_auto_capture_settings(dict(
+                enabled=True, first_time="18:00", second_time="22:00", min_images=1000,
+                first_attempt_date=self.day.isoformat(), threshold_met_date=self.day.isoformat(),
+            ))
+            gui.save_auto_capture_settings(self.app.program_root, self.app.settings, profile, config)
+            self.app.open_auto_capture_settings()
+            self.root.update()
+            dialog = self.app.auto_capture_settings_dialog
+            dialog.min_images.set("900")
+            self.app.set_busy(True)
+            self.assertTrue(dialog.save_button.instate(["disabled"]))
+            self.assertIn("暂不能保存", dialog.save_feedback.get())
+            dialog.save_button.invoke()
+            self.assertEqual(profile["auto_capture"]["min_images"], 1000)
+            self.app._auto_capture_context = dict(group_name="Recovery", target_day=self.day, minimum=1000, attempt=1)
+            self.app._finish_auto_capture(gui.CaptureResult(2, 1, 1, 2, Path("unused"), 1.0, 1000, False, 1))
+            self.root.update()
+            self.assertEqual(dialog.min_images.get(), "900")
+            self.app.set_busy(False)
+            self.assertFalse(dialog.save_button.instate(["disabled"]))
+            dialog.save_button.invoke()
+            saved = load_group_settings(self.app.program_root)["groups"][0]["auto_capture"]
+            self.assertEqual(saved["min_images"], 900)
+            self.assertEqual(saved["threshold_met_date"], self.day.isoformat())
+            self.assertIn("已保存", dialog.save_feedback.get())
 
 
 if __name__ == "__main__":

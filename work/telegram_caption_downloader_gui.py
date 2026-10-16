@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import asyncio
 import ctypes
+import hashlib
 import io
 import json
 import logging
@@ -26,10 +27,11 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
-from tkinter import BooleanVar, Frame, StringVar, TclError, Tk, Toplevel, filedialog, messagebox, simpledialog
+from tkinter import BooleanVar, Canvas, Frame, StringVar, TclError, Tk, Toplevel, filedialog, messagebox, simpledialog
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from ctypes import wintypes
+from typing import NamedTuple
 
 from PIL import Image, UnidentifiedImageError
 
@@ -41,11 +43,12 @@ APP_DATA = (
     / "运行数据"
 )
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.2.9"
+APP_VERSION = "v5.4.2"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DEFAULT_OUTPUT_PATH = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果")
-DOWNLOAD_CONCURRENCY = 6
+DOWNLOAD_CONCURRENCY = 14
+AUTO_CAPTURE_POLL_MS = 15000
 SPECIAL_RETRY_GROUP = "嫣然心水"
 SPECIAL_ADJACENT_LABEL = "乖乖团队"
 YANRAN_ADJACENT_LABELS = {"乖乖团队", "天机阁特围", "天机阁杀料", "恩平"}
@@ -66,6 +69,8 @@ XINAO_EXPERT_UNWANTED_MARKERS = {
     "平特一肖", "赚钱六肖", "五肖", "五码", "小数+双数",
 }
 STATUS_OUTPUT_DIR = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\outputs\抓取状态")
+MANUAL_CAPTURE_LOG_NAME = "手动抓取日志.json"
+MANUAL_CAPTURE_LOG_DAYS = 7
 DARK_BG = "#161719"
 DARK_SURFACE = "#1B1D20"
 DARK_FIELD = "#222428"
@@ -272,10 +277,10 @@ def normalize_account_phone(phone: str) -> str:
 
 
 def account_directory(app_data: Path, account_id: str) -> Path:
-    if account_id != "legacy" and not re.fullmatch(r"[0-9a-f]{32}", account_id):
+    if not re.fullmatch(r"[0-9a-f]{32}", account_id):
         raise ValueError("账号标识无效")
     root = Path(app_data).resolve()
-    directory = root if account_id == "legacy" else root / "accounts" / account_id
+    directory = root / "accounts" / account_id
     if not directory.resolve().is_relative_to(root):
         raise ValueError("账号保存路径无效")
     return directory
@@ -340,28 +345,39 @@ def load_account_session(session_path: Path, write_log=None):
     return StringSession(value)
 
 
-def load_account_profiles(app_data: Path) -> list[dict]:
+def read_account_entries(app_data: Path) -> list:
+    """Return the raw manifest entries without validating their ids."""
     path = Path(app_data) / "accounts.json"
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("accounts"), list):
+        raise ValueError("账号列表格式无效，原文件已保留")
+    return payload["accounts"]
+
+
+def load_account_profiles(app_data: Path) -> list[dict]:
     profiles = []
-    if path.exists():
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        if not isinstance(payload, dict) or not isinstance(payload.get("accounts"), list):
-            raise ValueError("账号列表格式无效，原文件已保留")
-        seen = set()
-        for item in payload["accounts"]:
-            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
-                raise ValueError("账号列表格式无效")
-            account_directory(app_data, item["id"])
-            name, user_id = item.get("name"), item.get("user_id")
-            if (item["id"] in seen or not isinstance(name, str) or not name.strip() or len(name) > 80
-                    or (user_id is not None and (type(user_id) is not int or user_id <= 0))):
-                raise ValueError("账号列表格式无效")
-            seen.add(item["id"])
-            profiles.append({"id": item["id"], "name": name, "user_id": user_id})
-    # The original session stays in place, including its SQLite journal/WAL files.
-    if (Path(app_data) / "credentials.bin").exists() and not any(p["id"] == "legacy" for p in profiles):
-        profiles.insert(0, {"id": "legacy", "name": "原有账号", "user_id": None})
+    seen = set()
+    for item in read_account_entries(app_data):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            raise ValueError("账号列表格式无效")
+        account_directory(app_data, item["id"])
+        name, user_id = item.get("name"), item.get("user_id")
+        if (item["id"] in seen or not isinstance(name, str) or not name.strip() or len(name) > 80
+                or (user_id is not None and (type(user_id) is not int or user_id <= 0))):
+            raise ValueError("账号列表格式无效")
+        seen.add(item["id"])
+        profiles.append({"id": item["id"], "name": name, "user_id": user_id})
     return profiles
+
+
+def write_account_manifest(app_data: Path, profiles: list[dict]) -> None:
+    path = Path(app_data) / "accounts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps({"accounts": profiles}, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def save_account_profile(app_data: Path, profile: dict) -> None:
@@ -369,11 +385,56 @@ def save_account_profile(app_data: Path, profile: dict) -> None:
     profiles = [profile if item["id"] == profile["id"] else item for item in profiles]
     if not any(item["id"] == profile["id"] for item in profiles):
         profiles.append(profile)
-    path = Path(app_data) / "accounts.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps({"accounts": profiles}, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    write_account_manifest(app_data, profiles)
+
+
+def migrate_legacy_account(app_data: Path) -> str:
+    """Turn the pre-multi-account root credentials/session into a normal account.
+
+    Returns the new account id, or "" when there is nothing left to migrate.
+    """
+    root = Path(app_data).resolve()
+    if not (root / "credentials.bin").is_file():
+        return ""
+    profiles = read_account_entries(root)
+    name, user_id = "原有账号", None
+    remaining = []
+    for item in profiles:
+        if isinstance(item, dict) and item.get("id") == "legacy":
+            if isinstance(item.get("name"), str) and item["name"].strip():
+                name = item["name"]
+            if type(item.get("user_id")) is int and item["user_id"] > 0:
+                user_id = item["user_id"]
+        else:
+            remaining.append(item)
+    account_id = uuid4().hex
+    directory = root / "accounts" / account_id
+    directory.mkdir(parents=True, exist_ok=True)
+    copied = []
+    try:
+        for source in (root / "credentials.bin", root / SESSION_BLOB_NAME, root / "account.session"):
+            if not source.is_file():
+                continue
+            target = directory / source.name
+            shutil.copy2(source, target)
+            if target.stat().st_size != source.stat().st_size:
+                raise OSError(f"原有账号迁移校验失败：{source.name}")
+            copied.append(source)
+    except OSError:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    write_account_manifest(root, [{"id": account_id, "name": name, "user_id": user_id}] + remaining)
+    selection = root / "account_selection.json"
+    if selection.is_file():
+        try:
+            payload = json.loads(selection.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("account_id") == "legacy":
+            save_selected_account(root, account_id)
+    for source in copied:
+        source.unlink()
+    return account_id
 
 
 def load_selected_account(app_data: Path) -> str:
@@ -433,6 +494,34 @@ def create_account_profile(app_data: Path, name: str, api_id: int, api_hash: str
     save_saved_credentials(directory / "credentials.bin", api_id, api_hash, phone)
     save_account_profile(app_data, profile)
     return profile
+
+
+def delete_account_profile(app_data: Path, account_id: str) -> None:
+    """Remove one account's manifest entry and its whole account directory."""
+    profiles = load_account_profiles(app_data)
+    if not any(item["id"] == account_id for item in profiles):
+        raise ValueError("要删除的账号不存在")
+    root = Path(app_data).resolve()
+    directory = account_directory(app_data, account_id)
+    if directory.resolve() == root or not directory.resolve().is_relative_to(root):
+        raise ValueError("账号保存路径无效")
+    remaining = [item for item in profiles if item["id"] != account_id]
+    path = root / "accounts.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps({"accounts": remaining}, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        os.replace(temporary, path)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
+    if directory.exists():
+        shutil.rmtree(directory)
+    selection = root / "account_selection.json"
+    try:
+        if selection.exists() and json.loads(selection.read_text(encoding="utf-8-sig")).get("account_id") == account_id:
+            selection.unlink()
+    except (OSError, ValueError):
+        pass
 
 
 def verify_account_user(profile: dict, user, phone: str) -> None:
@@ -580,6 +669,8 @@ def _default_group_settings() -> dict:
 
 
 def _write_group_settings(program_root: Path, settings: dict) -> None:
+    if settings.get("_load_error"):
+        raise ValueError(settings["_load_error"])
     path = group_directory(program_root) / GROUP_SETTINGS_NAME
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -612,6 +703,12 @@ def load_group_settings(program_root: Path, *, read_only: bool = False) -> dict:
             "start_time": start_time,
             "end_time": end_time,
         }
+        if "auto_capture" in item:
+            try:
+                group["auto_capture"] = normalize_auto_capture_settings(item.get("auto_capture"))
+            except ValueError:
+                # A broken schedule must not discard the group or its original configuration.
+                group["auto_capture"] = item.get("auto_capture")
         chat_id = item.get("chat_id")
         bound_account_id = item.get("bound_account_id")
         if chat_id is not None or bound_account_id is not None:
@@ -620,7 +717,7 @@ def load_group_settings(program_root: Path, *, read_only: bool = False) -> dict:
             if not isinstance(bound_account_id, str) or not bound_account_id.strip():
                 raise ValueError("群配置文件包含无效的绑定账号")
             bound_account_id = bound_account_id.strip()
-            if bound_account_id != "legacy" and not re.fullmatch(r"[0-9a-f]{32}", bound_account_id):
+            if not re.fullmatch(r"[0-9a-f]{32}", bound_account_id):
                 raise ValueError("群配置文件包含无效的绑定账号")
             group["chat_id"] = chat_id
             group["bound_account_id"] = bound_account_id
@@ -660,7 +757,7 @@ def save_group_profile(
         if not isinstance(bound_account_id, str) or not bound_account_id.strip():
             raise ValueError("私密群必须选择绑定账号")
         bound_account_id = bound_account_id.strip()
-        if bound_account_id != "legacy" and not re.fullmatch(r"[0-9a-f]{32}", bound_account_id):
+        if not re.fullmatch(r"[0-9a-f]{32}", bound_account_id):
             raise ValueError("绑定账号标识无效")
         address = ""
     start_time, end_time = validate_time_range(start_time, end_time)
@@ -752,6 +849,59 @@ def save_capture_status(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+def manual_capture_log_path(status_root: Path) -> Path:
+    return Path(status_root) / MANUAL_CAPTURE_LOG_NAME
+
+
+def save_manual_capture_log(path: Path, days: dict[str, list[str]]) -> None:
+    normalized = {
+        day: sorted(set(groups))
+        for day, groups in sorted(days.items())
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps({"days": normalized}, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def load_manual_capture_log(path: Path, today: date, *, log=None) -> dict[str, list[str]]:
+    """Load the manual-capture JSON log and retain only the latest seven days."""
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("days"), dict):
+        raise ValueError("手动抓取日志 JSON 格式无效")
+    cutoff = today - timedelta(days=MANUAL_CAPTURE_LOG_DAYS - 1)
+    retained: dict[str, list[str]] = {}
+    for raw_day, groups in payload["days"].items():
+        if not isinstance(raw_day, str) or not isinstance(groups, list):
+            raise ValueError("手动抓取日志 JSON 格式无效")
+        logged_day = parse_day(raw_day)
+        if any(not isinstance(group, str) or not group.strip() for group in groups):
+            raise ValueError("手动抓取日志包含无效群组")
+        if cutoff <= logged_day <= today:
+            retained[logged_day.isoformat()] = sorted({group.strip() for group in groups})
+    if retained != payload["days"]:
+        try:
+            save_manual_capture_log(path, retained)
+        except OSError as exc:
+            if log is not None:
+                log(f"【手动抓取】过期记录清理失败，继续使用已读取的有效记录：{exc}")
+    return retained
+
+
+def record_manual_capture(path: Path, group_name: str, target_day: date) -> bool:
+    today = datetime.now(CN_TZ).date()
+    cutoff = today - timedelta(days=MANUAL_CAPTURE_LOG_DAYS - 1)
+    if not cutoff <= target_day <= today:
+        return False
+    days = load_manual_capture_log(path, today)
+    day = target_day.isoformat()
+    days[day] = sorted(set(days.get(day, [])) | {group_name})
+    save_manual_capture_log(path, days)
+    return True
+
+
 def notes_for_retry(notes: dict[str, str], status: dict | None) -> dict[str, str]:
     completed = {
         label
@@ -759,6 +909,104 @@ def notes_for_retry(notes: dict[str, str], status: dict | None) -> dict[str, str
         if item.get("status") == "已完成"
     }
     return {keyword: label for keyword, label in notes.items() if label not in completed}
+
+
+MessageKey = tuple[str, int]
+
+
+def source_tag(address: str) -> str:
+    """来源地址的固定短标识：用于文件名区分不同来源的同号消息。"""
+    return hashlib.sha1(str(address).strip().encode("utf-8")).hexdigest()[:8]
+
+
+def remark_message_keys(
+    remark: dict, field: str, legacy_field: str, sources: list[str]
+) -> set[MessageKey]:
+    """读取备注的 {source,id} 引用；旧格式纯数字ID仅在单一来源时按该来源转换。"""
+    keys: set[MessageKey] = set()
+    for ref in remark.get(field) or []:
+        try:
+            if isinstance(ref, dict) and ref.get("source") is not None and ref.get("id") is not None:
+                keys.add((str(ref["source"]), int(ref["id"])))
+        except (TypeError, ValueError):
+            continue
+    if not keys and len(sources) == 1:
+        for message_id in remark.get(legacy_field) or []:
+            try:
+                keys.add((str(sources[0]), int(message_id)))
+            except (TypeError, ValueError):
+                continue
+    return keys
+
+
+def message_refs(keys) -> list[dict]:
+    return [{"source": source, "id": message_id} for source, message_id in sorted(keys)]
+
+
+def format_message_keys(keys) -> str:
+    return "、".join(f"{source} #{message_id}" for source, message_id in sorted(keys)) or "无"
+
+
+def has_legacy_remark_ids(remarks: dict) -> bool:
+    return any(
+        item.get("image_message_ids") or item.get("pending_message_ids")
+        for item in remarks.values()
+        if isinstance(item, dict)
+    )
+
+
+# 旧版文件名：YYYYMMDD_HHMMSS_<消息ID>.<扩展名>（无来源标识；新文件名多一段 source_tag）。
+LEGACY_FILENAME_PATTERN = re.compile(r"\d{8}_\d{6}_\d+\.[A-Za-z0-9]{1,10}")
+UNMAPPED_LEGACY_DIR = "_旧文件未映射"
+REPORT_HEADER = ["备注", "来源", "消息ID", "北京时间", "本地文件"]
+
+
+class CaptureResult(NamedTuple):
+    scanned_messages: int
+    downloaded: int
+    unmatched: int
+    matched_total: int
+    result_path: Path
+    total_elapsed: float
+    discovered_images: int
+    threshold_blocked: bool = False
+    failed_images: int = 0
+
+
+def downloaded_file_is_complete(path: Path, message, *, previously_failed: bool = False) -> bool:
+    if not path.is_file():
+        return False
+    size = path.stat().st_size
+    expected = getattr(getattr(message, "file", None), "size", None)
+    if isinstance(expected, int) and expected > 0:
+        return size == expected
+    # Old failed downloads without a known size cannot be trusted merely because they exist.
+    return size > 0 and not previously_failed
+
+
+def report_row_key(row) -> tuple[str, str, str, str]:
+    """报告行唯一键 (备注, 来源, 消息ID, 本地文件)；旧 4 列格式没有来源，来源视为空字符串。"""
+    cells = [str(cell) for cell in row]
+    if len(cells) >= 5:
+        return (cells[0], cells[1], cells[2], cells[4])
+    return (cells[0], "", cells[1], cells[3])
+
+
+def read_report_keys(path: Path) -> set[tuple[str, str, str, str]]:
+    """读取现有报告的行键（同时兼容 4 列旧格式与 5 列新格式）；读取失败视为无已有行。"""
+    keys: set[tuple[str, str, str, str]] = set()
+    if not path.is_file():
+        return keys
+    try:
+        with path.open("r", newline="", encoding="utf-8-sig") as handle:
+            reader = csv.reader(handle)
+            next(reader, None)
+            for row in reader:
+                if len(row) >= 4:
+                    keys.add(report_row_key(row))
+    except OSError:
+        return set()
+    return keys
 
 
 def _notes_from_entries(entries) -> dict[str, str]:
@@ -817,6 +1065,111 @@ def parse_clock(value: str) -> clock_time:
         return datetime.strptime(value.strip(), "%H:%M").time()
     except ValueError as exc:
         raise ValueError("时间格式应为 HH:MM，例如 14:30") from exc
+
+
+AUTO_CAPTURE_DEFAULTS = {
+    "enabled": False,
+    "first_time": "",
+    "second_time": "",
+    "min_images": 0,
+    "last_discovered_images": None,
+    "last_discovered_date": "",
+    "first_attempt_date": "",
+    "second_attempt_date": "",
+    "threshold_met_date": "",
+    "captured_date": "",
+}
+
+
+def default_auto_capture_settings() -> dict:
+    return dict(AUTO_CAPTURE_DEFAULTS)
+
+
+def _normalize_auto_capture_date(value, field: str) -> str:
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"自动抓取配置的 {field} 必须是日期文字")
+    try:
+        return parse_day(value).isoformat()
+    except ValueError as exc:
+        raise ValueError(f"自动抓取配置的 {field} 日期无效") from exc
+
+
+def normalize_auto_capture_settings(value) -> dict:
+    """Validate and normalize the per-group, same-day automatic capture state."""
+    if value is None:
+        return default_auto_capture_settings()
+    if not isinstance(value, dict):
+        raise ValueError("自动抓取配置必须是对象")
+    result = default_auto_capture_settings()
+    enabled = value.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("自动抓取配置的 enabled 必须是布尔值")
+    result["enabled"] = enabled
+    for field in ("first_time", "second_time"):
+        raw = value.get(field, "")
+        if raw in (None, ""):
+            result[field] = ""
+            continue
+        if not isinstance(raw, str):
+            raise ValueError(f"自动抓取配置的 {field} 必须是 HH:MM")
+        result[field] = parse_clock(raw).strftime("%H:%M")
+    if result["first_time"] and result["second_time"]:
+        if parse_clock(result["second_time"]) <= parse_clock(result["first_time"]):
+            raise ValueError("第二次自动抓取时间必须晚于第一次")
+    minimum = value.get("min_images", 0)
+    if type(minimum) is not int or minimum < 0:
+        raise ValueError("最低图片数量必须是大于等于 0 的整数")
+    result["min_images"] = minimum
+    discovered = value.get("last_discovered_images")
+    if discovered is not None and (type(discovered) is not int or discovered < 0):
+        raise ValueError("最终发现图片数量必须是大于等于 0 的整数或空值")
+    result["last_discovered_images"] = discovered
+    for field in ("last_discovered_date", "first_attempt_date", "second_attempt_date", "threshold_met_date", "captured_date"):
+        result[field] = _normalize_auto_capture_date(value.get(field, ""), field)
+    if result["enabled"]:
+        if not result["first_time"] or not result["second_time"]:
+            raise ValueError("启用自动抓取时必须填写第一次和第二次时间")
+        if result["min_images"] <= 0:
+            raise ValueError("启用自动抓取时最低图片数量必须大于 0")
+    return result
+
+
+def get_auto_capture_settings(profile: dict) -> dict:
+    try:
+        return normalize_auto_capture_settings(profile.get("auto_capture"))
+    except ValueError:
+        return default_auto_capture_settings()
+
+
+def save_auto_capture_settings(program_root: Path, settings: dict, profile: dict, config: dict) -> None:
+    config = normalize_auto_capture_settings(config)
+    payload = dict(settings, groups=[
+        dict(item, auto_capture=config) if item is profile else item
+        for item in settings.get("groups", [])
+    ])
+    _write_group_settings(program_root, payload)
+    profile["auto_capture"] = config
+
+
+def auto_capture_due(config: dict, now: datetime) -> int | None:
+    """Return attempt 1 or 2 when a configured same-day run is due."""
+    config = normalize_auto_capture_settings(config)
+    if not config["enabled"] or not config["first_time"] or not config["second_time"]:
+        return None
+    day = now.date().isoformat()
+    if config["captured_date"] == day or config["threshold_met_date"] == day:
+        return None
+    if config["first_attempt_date"] != day and now.time() >= parse_clock(config["first_time"]):
+        return 1
+    if (
+        config["first_attempt_date"] == day
+        and config["second_attempt_date"] != day
+        and now.time() >= parse_clock(config["second_time"])
+    ):
+        return 2
+    return None
 
 
 def format_duration(seconds: float) -> str:
@@ -1435,10 +1788,21 @@ class TelegramDownloaderApp:
         self.program_root = Path(program_root) if program_root else runtime_root()
         self.status_root = Path(status_root) if status_root else STATUS_OUTPUT_DIR
         self._workflow_log_path = Path(workflow_log).expanduser() if workflow_log else None
+        notes_errors = []
         try:
-            self.settings = load_group_settings(self.program_root)
-        except (OSError, ValueError, json.JSONDecodeError):
+            self.settings = load_group_settings(self.program_root, read_only=True)
+        except (OSError, ValueError) as exc:
             self.settings = _default_group_settings()
+            self.settings["_load_error"] = (
+                f"群配置读取失败，原文件已保留：{self.program_root / GROUP_DIR_NAME / GROUP_SETTINGS_NAME}；"
+                f"{exc}。请修复后重启软件。"
+            )
+        else:
+            for profile in self.settings["groups"]:
+                try:
+                    migrate_group_notes_config(self.program_root, profile["name"])
+                except (OSError, ValueError) as exc:
+                    notes_errors.append(f"备注配置读取失败，原文件已保留：{group_notes_path(self.program_root, profile['name'])}；{exc}")
         self.root.title(f"登录飞机提取图片 {APP_VERSION}")
         self.window_preset = self._initial_window_preset()
         window_width, window_height = self._window_size_for_preset(self.window_preset)
@@ -1492,15 +1856,35 @@ class TelegramDownloaderApp:
         self._workflow_mode = False
         self._workflow_group = ""
         self._workflow_exit_code: int | None = None
+        self._auto_capture_timer = None
+        self._auto_capture_context: dict | None = None
+        self._auto_capture_wait_logs: set[tuple[str, str, int]] = set()
         self.root.bind("<Destroy>", self._on_capture_window_destroyed, add="+")
 
         self._build_ui()
+        self._account_migration_error = ""
+        try:
+            migrate_legacy_account(self.app_data)
+        except (OSError, ValueError) as exc:
+            self._account_migration_error = f"原有账号迁移失败（{type(exc).__name__}），原文件已保留：{exc}"
         self.refresh_account_profiles()
         self._load_runtime_log()
         self._schedule_log_rollover()
         self._pump_ui_callbacks()
         self.root.after_idle(lambda: self._enable_dark_title_bar(self.root))
         self.reload_group_profiles(self.chat.get())
+        for error in notes_errors:
+            self.log(error)
+        if self.settings.get("_load_error"):
+            self.log(self.settings["_load_error"])
+            self.task_status.set("群配置读取失败，已禁止覆盖；请修复配置后重启")
+        elif notes_errors:
+            self.task_status.set("部分备注配置读取失败，请查看日志中的文件路径")
+        if self._account_migration_error:
+            self.log(f"【账号】{self._account_migration_error}")
+            self._account_load_error = True
+            self.account_status.set("原有账号迁移失败，原文件已保留；请查看运行日志")
+        self._schedule_auto_capture()
         self._start_freeze_watchdog()
         if show_account_dialog:
             # Idle callbacks can run while the main window still has a 1x1 geometry.
@@ -1858,7 +2242,8 @@ class TelegramDownloaderApp:
         )
         self.update_retry_button()
         self.update_first_capture_status()
-        _write_group_settings(self.program_root, self.settings)
+        if not self.settings.get("_load_error"):
+            _write_group_settings(self.program_root, self.settings)
 
     def selected_group_profile(self, required: bool = True) -> dict | None:
         name = self.chat.get()
@@ -1930,7 +2315,196 @@ class TelegramDownloaderApp:
     def update_retry_button(self) -> None:
         self.retry_button.configure(state="normal" if self.chat.get() else "disabled")
 
+    def _schedule_auto_capture(self) -> None:
+        if self._auto_capture_timer is not None:
+            return
+        try:
+            self._auto_capture_timer = self.root.after(1000, self._auto_capture_tick)
+        except TclError:
+            self._auto_capture_timer = None
+
+    def _auto_capture_tick(self) -> None:
+        self._auto_capture_timer = None
+        try:
+            self._check_auto_capture_schedule()
+        finally:
+            try:
+                self._auto_capture_timer = self.root.after(AUTO_CAPTURE_POLL_MS, self._auto_capture_tick)
+            except TclError:
+                self._auto_capture_timer = None
+
+    def _check_auto_capture_schedule(self, now: datetime | None = None) -> None:
+        if self._busy or self._workflow_mode or self._auto_capture_context is not None:
+            return
+        now = now or datetime.now(CN_TZ)
+        day = now.date().isoformat()
+        self._auto_capture_wait_logs = {key for key in self._auto_capture_wait_logs if key[1] == day}
+        try:
+            manual_capture_days = load_manual_capture_log(
+                manual_capture_log_path(self.status_root), now.date(), log=self.log
+            )
+            manual_capture_groups = set(manual_capture_days.get(day, []))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            manual_capture_groups = set()
+            wait_key = ("__手动抓取日志__", day, -1)
+            if wait_key not in self._auto_capture_wait_logs:
+                self._auto_capture_wait_logs.add(wait_key)
+                self.log(f"【自动抓取】手动抓取日志读取失败，未跳过自动抓取：{exc}")
+        for profile in self.settings.get("groups", []):
+            if profile["name"] in manual_capture_groups:
+                wait_key = (profile["name"], day, -1)
+                if wait_key not in self._auto_capture_wait_logs:
+                    self._auto_capture_wait_logs.add(wait_key)
+                    self.log(f"【自动抓取】{profile['name']} 当天已有手动抓取记录，跳过自动抓取")
+                continue
+            try:
+                config = normalize_auto_capture_settings(profile.get("auto_capture"))
+            except ValueError as exc:
+                wait_key = (profile["name"], now.date().isoformat(), 0)
+                if wait_key not in self._auto_capture_wait_logs:
+                    self._auto_capture_wait_logs.add(wait_key)
+                    self.log(f"【自动抓取】{profile['name']} 配置无效，自动抓取未启动；原配置保留：{exc}")
+                continue
+            attempt = auto_capture_due(config, now)
+            if not attempt:
+                continue
+            # Public groups use the currently logged-in account. A private group
+            # has its own bound session and can be dispatched independently.
+            if profile.get("chat_id") is None and (
+                not self.logged_in
+                or not self.active_account_id
+                or self.active_account_id != self.selected_account_id
+            ):
+                wait_key = (profile["name"], now.date().isoformat(), attempt)
+                if wait_key not in self._auto_capture_wait_logs:
+                    self._auto_capture_wait_logs.add(wait_key)
+                    self.log(f"【自动抓取】{profile['name']} 到达第 {attempt} 次时间，但当前账号未登录，暂不执行")
+                continue
+            self._begin_auto_capture(profile, config, attempt, now.date())
+            break
+
+    def _begin_auto_capture(self, profile: dict, config: dict, attempt: int, target_day: date) -> None:
+        day = target_day.isoformat()
+        if attempt == 1:
+            if config.get("last_discovered_date") != day:
+                config["last_discovered_images"] = None
+                config["last_discovered_date"] = ""
+            config.update(
+                first_attempt_date=day,
+                second_attempt_date="",
+                threshold_met_date="",
+                captured_date="",
+            )
+        else:
+            config["second_attempt_date"] = day
+        try:
+            save_auto_capture_settings(self.program_root, self.settings, profile, config)
+        except (OSError, ValueError) as exc:
+            self.log(f"【自动抓取】{profile['name']} 无法保存执行记录，本次未启动：{exc}")
+            return
+        self._auto_capture_context = {
+            "group_name": profile["name"],
+            "attempt": attempt,
+            "target_day": target_day,
+            "minimum": profile["auto_capture"]["min_images"],
+        }
+        self.log(
+            f"【自动抓取】{profile['name']} 开始第 {attempt} 次扫描：{day}；"
+            f"最低图片数量 {profile['auto_capture']['min_images']}"
+        )
+        try:
+            self.start_download(
+                group_name_override=profile["name"],
+                target_day_override=target_day,
+                auto_attempt=attempt,
+                auto_min_images=profile["auto_capture"]["min_images"],
+            )
+        except Exception as exc:
+            self.log(f"【自动抓取】{profile['name']} 启动失败：{type(exc).__name__}: {exc}")
+            self._auto_capture_failure(str(exc))
+
+    def _auto_capture_failure(self, detail: str = "自动抓取失败", discovered_images: int | None = None) -> None:
+        context = self._auto_capture_context
+        self._auto_capture_context = None
+        if context:
+            if discovered_images is not None:
+                profile = next((item for item in self.settings.get("groups", []) if item["name"] == context["group_name"]), None)
+                if profile is not None:
+                    config = get_auto_capture_settings(profile)
+                    day = context["target_day"].isoformat()
+                    config.update(last_discovered_images=discovered_images, last_discovered_date=day)
+                    if discovered_images >= context["minimum"]:
+                        config["threshold_met_date"] = day
+                    try:
+                        save_auto_capture_settings(self.program_root, self.settings, profile, config)
+                    except OSError as exc:
+                        self.log(f"【自动抓取】最终发现数量保存失败：{exc}")
+            self.task_status.set(f"自动抓取失败：{context['group_name']}")
+            self.log(f"【自动抓取】{context['group_name']} 第 {context['attempt']} 次失败：{detail}")
+
+    def _finish_auto_capture(self, result: CaptureResult) -> None:
+        context = self._auto_capture_context
+        if not context:
+            return
+        profile = next(
+            (item for item in self.settings.get("groups", []) if item["name"] == context["group_name"]),
+            None,
+        )
+        if profile is None:
+            self._auto_capture_context = None
+            self.log(f"【自动抓取】群配置已不存在：{context['group_name']}")
+            return
+        config = get_auto_capture_settings(profile)
+        day = context["target_day"].isoformat()
+        config["last_discovered_images"] = result.discovered_images
+        config["last_discovered_date"] = day
+        if result.threshold_blocked:
+            if context["attempt"] == 1:
+                status = (
+                    f"自动扫描第 1 次：发现 {result.discovered_images} 张，低于最低 "
+                    f"{context['minimum']} 张，等待第二次扫描"
+                )
+                self.log(f"【自动抓取】{context['group_name']}：{status}")
+            else:
+                status = (
+                    f"自动扫描第 2 次：发现 {result.discovered_images} 张，低于最低 "
+                    f"{context['minimum']} 张，今日停止"
+                )
+                self.log(f"【自动抓取】{context['group_name']}：{status}")
+        else:
+            config["threshold_met_date"] = day
+            if result.failed_images or result.unmatched:
+                config["captured_date"] = ""
+                status = (
+                    f"自动抓取未完成：发现 {result.discovered_images} 张，扫描已达标；"
+                    f"成功 {result.downloaded} 张，下载失败 {result.failed_images} 张，"
+                    f"待补抓备注 {result.unmatched} 项，请使用同日复抓"
+                )
+            else:
+                config["captured_date"] = day
+                status = (
+                    f"自动抓取完成：发现 {result.discovered_images} 张，已达到最低 "
+                    f"{context['minimum']} 张；成功 {result.downloaded} 张"
+                )
+            self.log(f"【自动抓取】{context['group_name']}：{status}")
+        try:
+            save_auto_capture_settings(self.program_root, self.settings, profile, config)
+        except (OSError, ValueError) as exc:
+            self._auto_capture_context = None
+            self.log(f"【自动抓取】{context['group_name']} 执行结果保存失败：{exc}")
+            self.task_status.set(f"自动抓取结果保存失败：{context['group_name']}")
+            return
+        self._auto_capture_context = None
+        self.task_status.set(status)
+        dialog = getattr(self, "auto_capture_settings_dialog", None)
+        if dialog is not None and dialog.window.winfo_exists():
+            dialog.refresh_result(context["group_name"])
+        self.update_first_capture_status()
+
     def open_group_settings(self) -> None:
+        if self.settings.get("_load_error"):
+            messagebox.showwarning("群配置不可用", self.settings["_load_error"])
+            return
         GroupSettingsDialog(self)
 
     def refresh_account_profiles(self) -> bool:
@@ -2014,6 +2588,37 @@ class TelegramDownloaderApp:
         self.account_status.set("添加账号：填写后点击保存并登录")
         self._update_account_form()
 
+    def delete_account(self) -> None:
+        if self._busy or self._account_load_error:
+            return
+        profile = next((item for item in self.account_profiles if item["id"] == self.selected_account_id), None)
+        if profile is None:
+            messagebox.showwarning("请选择账号", "请先在下拉列表中选择要删除的账号。", parent=self.login_settings_window)
+            return
+        if self.logged_in and self.active_account_id == profile["id"]:
+            messagebox.showwarning("无法删除", "该账号正在登录使用中，请先退出登录后再删除。", parent=self.login_settings_window)
+            return
+        if not messagebox.askyesno(
+            "删除账号",
+            f"确定删除账号“{profile['name']}”吗？\n\n将同时删除该账号的登录凭据和会话文件，删除后无法恢复，需要重新添加并登录。",
+            parent=self.login_settings_window,
+        ):
+            return
+        try:
+            delete_account_profile(self.app_data, profile["id"])
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("删除失败", f"账号删除失败：{exc}", parent=self.login_settings_window)
+            self.log(f"【账号】删除账号失败（{type(exc).__name__}）：{exc}")
+            return
+        self.selected_account_id = ""
+        self.adding_account = False
+        for variable in (self.api_id, self.api_hash, self.phone, self.account_name):
+            variable.set("")
+        self.account_status.set(f"已删除账号：{profile['name']}，请重新选择或添加账号")
+        self.log(f"【账号】已删除账号：{profile['name']}")
+        self.refresh_account_profiles()
+        self._update_account_form()
+
     def _update_account_form(self) -> None:
         window = getattr(self, "login_settings_window", None)
         if window is None or not window.winfo_exists():
@@ -2025,10 +2630,15 @@ class TelegramDownloaderApp:
             self.phone_entry.configure(state="readonly")
         self.account_combo.configure(state="disabled" if self._busy else "readonly")
         self.add_account_button.configure(state="disabled" if self._busy or self._account_load_error else "normal")
+        self.delete_account_button.configure(
+            state="normal" if (not self._busy and not self._account_load_error
+                              and bool(self.selected_account_id)) else "disabled"
+        )
         self.login_submit_button.configure(
             state="normal" if editable else "disabled",
             text="保存并登录" if self.adding_account else "登录所选账号",
         )
+        self.auto_capture_button.configure(state="disabled" if self._busy else "normal")
         self.login_close_button.configure(state="disabled" if self._busy else "normal")
 
     def close_login_settings(self) -> None:
@@ -2070,6 +2680,8 @@ class TelegramDownloaderApp:
         self.account_combo.bind("<<ComboboxSelected>>", self.on_account_selected)
         self.add_account_button = ttk.Button(selector, text="添加账号", command=self.begin_add_account)
         self.add_account_button.pack(side="right", padx=(12, 0))
+        self.delete_account_button = ttk.Button(selector, text="删除账号", command=self.delete_account)
+        self.delete_account_button.pack(side="right", padx=(12, 0))
 
         form = ttk.Frame(frame, style="Card.TFrame", padding=18)
         form.pack(fill="x")
@@ -2111,6 +2723,10 @@ class TelegramDownloaderApp:
             buttons, text="登录所选账号", style="Accent.TButton", command=self.login
         )
         self.login_submit_button.pack(side="left")
+        self.auto_capture_button = ttk.Button(
+            buttons, text="自动抓取设置", command=self.open_auto_capture_settings
+        )
+        self.auto_capture_button.pack(side="left", padx=(12, 0))
         self.login_close_button = ttk.Button(buttons, text="暂不登录", command=self.close_login_settings)
         self.login_close_button.pack(side="right")
         if self.refresh_account_profiles() and not self.account_profiles:
@@ -2122,6 +2738,17 @@ class TelegramDownloaderApp:
         self.account_combo.focus_set()
         window.after_idle(lambda: self._enable_dark_title_bar(window))
 
+    def open_auto_capture_settings(self) -> None:
+        if self._busy:
+            return
+        existing = getattr(self, "auto_capture_settings_dialog", None)
+        if existing is not None and existing.window.winfo_exists():
+            self._center_dialog(existing.window, 1020, 720)
+            existing.window.lift()
+            existing.window.focus_force()
+            return
+        self.auto_capture_settings_dialog = AutoCaptureSettingsDialog(self)
+
     def open_notes_file(self) -> None:
         if not self.chat.get():
             messagebox.showwarning("尚未配置", "请先点击“设置…”添加群配置")
@@ -2132,6 +2759,9 @@ class TelegramDownloaderApp:
         self._open_with_shell(path)
 
     def choose_output(self) -> None:
+        if self.settings.get("_load_error"):
+            messagebox.showwarning("群配置不可用", self.settings["_load_error"])
+            return
         selected = filedialog.askdirectory(title="选择保存目录")
         if selected:
             self.output_path.set(selected)
@@ -2379,6 +3009,9 @@ class TelegramDownloaderApp:
         for widget in self.busy_widgets:
             widget.configure(state="disabled" if busy else self._busy_widget_states.get(widget, "normal"))
         self._update_account_form()
+        dialog = getattr(self, "auto_capture_settings_dialog", None)
+        if dialog is not None and dialog.window.winfo_exists():
+            dialog.set_busy(busy)
         if status:
             self.task_status.set(status)
         if self._capture_started is not None:
@@ -2394,6 +3027,12 @@ class TelegramDownloaderApp:
         if event.widget is self.root:
             self._watchdog_stop.set()
             self._stop_capture_progress()
+            if self._auto_capture_timer is not None:
+                try:
+                    self.root.after_cancel(self._auto_capture_timer)
+                except TclError:
+                    pass
+                self._auto_capture_timer = None
             if self._ui_pump_id is not None:
                 try:
                     self.root.after_cancel(self._ui_pump_id)
@@ -2575,7 +3214,7 @@ class TelegramDownloaderApp:
                 self.log(f"【错误】任务中止：{type(exc).__name__}: {exc}")
                 def fail(text=error_text) -> None:
                     self.set_busy(False, "操作失败")
-                    if not self._workflow_mode:
+                    if not self._workflow_mode and self._auto_capture_context is None:
                         messagebox.showerror("操作失败", text)
                     if on_failure is not None:
                         on_failure(text) if self._workflow_mode else on_failure()
@@ -2741,9 +3380,18 @@ class TelegramDownloaderApp:
         else:
             self.open_login_settings()
 
-    def validate_task(self) -> tuple[Path, Path, date, clock_time, clock_time, str, dict]:
-        group_name = self.chat.get().strip()
-        group_profile = dict(self.selected_group_profile())
+    def validate_task(
+        self,
+        group_name_override: str | None = None,
+        target_day_override: date | None = None,
+    ) -> tuple[Path, Path, date, clock_time, clock_time, str, dict]:
+        group_name = (group_name_override if group_name_override is not None else self.chat.get()).strip()
+        group_profile = next(
+            (dict(item) for item in self.settings.get("groups", []) if item["name"] == group_name),
+            None,
+        )
+        if group_profile is None:
+            raise ValueError("请先点击“设置…”添加并选择群配置")
         start_clock = parse_clock(group_profile["start_time"])
         end_clock = parse_clock(group_profile["end_time"])
         notes_file = group_notes_path(self.program_root, group_name).resolve()
@@ -2752,15 +3400,30 @@ class TelegramDownloaderApp:
         output = Path(self.output_path.get().strip().strip('"')).expanduser().resolve()
         self.settings["output_path"] = str(output)
         _write_group_settings(self.program_root, self.settings)
-        try:
-            target_day = parse_day(self.day.get())
-        except ValueError as exc:
-            raise ValueError("日期格式应为 YYYY-MM-DD") from exc
+        if target_day_override is None:
+            try:
+                target_day = parse_day(self.day.get())
+            except ValueError as exc:
+                raise ValueError("日期格式应为 YYYY-MM-DD") from exc
+        elif isinstance(target_day_override, date) and not isinstance(target_day_override, datetime):
+            target_day = target_day_override
+        else:
+            raise ValueError("自动抓取日期无效")
         return notes_file, output, target_day, start_clock, end_clock, group_name, group_profile
 
-    def start_download(self, notes_override: dict[str, str] | None = None, retry: bool = False) -> None:
+    def start_download(
+        self,
+        notes_override: dict[str, str] | None = None,
+        retry: bool = False,
+        *,
+        group_name_override: str | None = None,
+        target_day_override: date | None = None,
+        auto_attempt: int | None = None,
+        auto_min_images: int | None = None,
+    ) -> None:
         if self._busy:
             return
+        scheduled = auto_attempt is not None
         try:
             (
                 notes_file,
@@ -2770,7 +3433,7 @@ class TelegramDownloaderApp:
                 end_clock,
                 group_name,
                 group_profile,
-            ) = self.validate_task()
+            ) = self.validate_task(group_name_override, target_day_override)
             if notes_override is not None:
                 default_notes, address_notes = dict(notes_override), {}
             else:
@@ -2792,6 +3455,8 @@ class TelegramDownloaderApp:
                     raise ValueError("私密群绑定账号的本地会话不存在，请先登录该账号后重试")
             else:
                 if not self.logged_in or not self.active_account_id or self.active_account_id != self.selected_account_id:
+                    if scheduled:
+                        raise ValueError("默认账号尚未登录")
                     if self._workflow_mode:
                         self._workflow_fail("默认账号尚未登录")
                     else:
@@ -2806,7 +3471,9 @@ class TelegramDownloaderApp:
             api_id, api_hash, account_phone = saved
             session_path = task_directory / "account"
         except (OSError, ValueError) as exc:
-            if self._workflow_mode:
+            if scheduled:
+                self._auto_capture_failure(str(exc))
+            elif self._workflow_mode:
                 self._workflow_fail(str(exc))
             else:
                 messagebox.showwarning("信息不完整", str(exc))
@@ -2816,7 +3483,7 @@ class TelegramDownloaderApp:
         if chat_id is not None:
             self.log(f"【账号】本次私密群抓取使用：{account_profile.get('name') or task_account_id}；Chat ID：{chat_id}")
 
-        def operation() -> tuple[int, int, int, int, Path, float]:
+        def operation() -> CaptureResult:
             operation_started = time.monotonic()
             group_output = dated_group_output(output, target_day, group_name)
             status_enabled = notes_override is None
@@ -2842,23 +3509,49 @@ class TelegramDownloaderApp:
             base_notes_by_source = {
                 address: address_notes.get(address, default_notes) for address in source_order
             }
+            previous_remarks_raw = (previous_status or {}).get("remarks", {})
+            legacy_state = bool(incremental and has_legacy_remark_ids(previous_remarks_raw))
+            # 多链接群的旧状态无法判定旧消息ID属于哪个来源：走一次全量迁移（不跳过已完成备注），
+            # 用当天真实扫描结果重建来源级状态，而不是猜测来源或直接丢弃旧消息ID。
+            legacy_migration = legacy_state and len(source_order) > 1
+            # 单链接群的旧文件可以安全迁移（旧名只可能是这个来源的）。
+            single_source = len(source_order) == 1
             if incremental:
-                source_scan_notes = {
-                    address: notes_for_retry(notes_map, previous_status)
-                    for address, notes_map in base_notes_by_source.items()
-                }
+                if legacy_migration:
+                    source_scan_notes = dict(base_notes_by_source)
+                else:
+                    source_scan_notes = {
+                        address: notes_for_retry(notes_map, previous_status)
+                        for address, notes_map in base_notes_by_source.items()
+                    }
             else:
                 source_scan_notes = dict(base_notes_by_source)
             all_labels = sorted({
-                label for notes_map in base_notes_by_source.values() for label in notes_map.values()
+                label for notes_map in base_notes_by_source.values()
+                for label in (notes_map.values() if notes_map else ["全部图片"])
             })
             pending_labels = {
                 label for notes_map in source_scan_notes.values() for label in notes_map.values()
             }
-            retry_full_day = incremental and any(
-                not (previous_status or {}).get("remarks", {}).get(label, {}).get("pending_message_ids")
-                for label in pending_labels
+            # Old all-image captures did not record failed IDs. Reconcile them once from this day's messages.
+            retry_full_day = legacy_migration or (
+                incremental and any(not notes for notes in base_notes_by_source.values())
+                and "全部图片" not in previous_remarks_raw
+            ) or (
+                incremental
+                and any(
+                    not remark_message_keys(
+                        previous_remarks_raw.get(label, {}), "pending_messages", "pending_message_ids", source_order
+                    )
+                    for label in pending_labels
+                )
             )
+            if legacy_state:
+                if len(source_order) == 1:
+                    self.log(f"【复抓】状态为旧格式（消息ID未记录来源）：单链接群 {source_order[0]} 已按唯一来源自动转换")
+                else:
+                    self.log("【复抓】状态为旧格式（消息ID未记录来源），多链接群无法判定来源："
+                             "本次重新扫描当天全部消息（含已完成备注），以重新生成来源级状态")
             if not retry:
                 reason = "点击正常抓取，执行全量"
             elif previous_status is None:
@@ -2956,22 +3649,29 @@ class TelegramDownloaderApp:
                 if not isinstance(saved_last_ids, dict):
                     saved_last_ids = {}
                 current_last_ids: dict[str, int] = {}
-                pending_ids = sorted(
-                    {
-                        int(message_id)
-                        for item in (previous_status or {}).get("remarks", {}).values()
-                        for message_id in item.get("pending_message_ids", [])
-                    }
-                )
+                source_pending_ids = {
+                    address: sorted(
+                        {
+                            message_id
+                            for item in previous_remarks_raw.values()
+                            for source, message_id in remark_message_keys(
+                                item, "pending_messages", "pending_message_ids", source_order
+                            )
+                            if source == address
+                        }
+                    )
+                    for address in source_order
+                }
                 for source_index, (chat_address, entity) in enumerate(entities, 1):
                     source_started = time.monotonic()
                     before_messages, before_images = len(all_messages), len(media_messages)
                     source_last_id = int(saved_last_ids.get(chat_address, 0) or 0)
+                    source_pending = source_pending_ids.get(chat_address, [])
                     self.log(f"【扫描】开始链接 {source_index}/{len(entities)}：{chat_address}")
                     if retry_full_day:
                         self.log(f"【复抓】来源 {chat_address}：未完成备注没有旧消息ID，重新扫描当天消息")
                     elif incremental:
-                        self.log(f"【复抓】来源 {chat_address}：读取消息ID > {source_last_id}，重查待处理消息 {len(pending_ids)} 条")
+                        self.log(f"【复抓】来源 {chat_address}：读取消息ID > {source_last_id}，重查待处理消息 {len(source_pending)} 条")
                     source_ids: list[int] = []
                     if retry_full_day:
                         for message in client.iter_messages(entity, offset_date=end_utc):
@@ -2981,9 +3681,9 @@ class TelegramDownloaderApp:
                             if message is not None and (chat_address, getattr(message, "id", None)) in seen_keys:
                                 source_ids.append(message.id)
                     elif incremental:
-                        if pending_ids:
+                        if source_pending:
                             getter = getattr(client, "get_messages", None)
-                            pending_messages = getter(entity, ids=pending_ids) if getter else []
+                            pending_messages = getter(entity, ids=source_pending) if getter else []
                             if pending_messages is None:
                                 pending_messages = []
                             elif not isinstance(pending_messages, (list, tuple)):
@@ -3015,12 +3715,28 @@ class TelegramDownloaderApp:
                              f"耗时 {format_duration(time.monotonic() - source_started)}")
 
                 scanned = len(all_messages)
-                self.set_progress(len(media_messages), 0, f"备注匹配：共 {len(media_messages)} 张图片")
+                discovered_images = len(media_messages)
+                self.set_progress(discovered_images, 0, f"备注匹配：共 {discovered_images} 张图片")
+                if scheduled and auto_min_images is not None and discovered_images < auto_min_images:
+                    self.log(
+                        f"【自动抓取】第 {auto_attempt} 次扫描结束：发现 {discovered_images} 张图片，"
+                        f"低于最低 {auto_min_images} 张；不进入备注匹配、下载和状态写入"
+                    )
+                    return CaptureResult(
+                        scanned,
+                        0,
+                        0,
+                        0,
+                        group_output,
+                        time.monotonic() - operation_started,
+                        discovered_images,
+                        True,
+                    )
 
                 source_selections: dict[str, dict[int, set[str]]] = {}
                 source_preview_caches: dict[str, dict[int, bytes]] = {}
                 source_exact_labels: dict[str, set[str]] = {}
-                ignored_note_ids: dict[str, set[int]] = defaultdict(set)
+                ignored_note_ids: dict[str, set[MessageKey]] = defaultdict(set)
 
                 def prepare_source(chat_address: str) -> tuple[dict[int, set[str]], dict[int, bytes]]:
                     source_media_messages = source_media.get(chat_address, [])
@@ -3143,26 +3859,36 @@ class TelegramDownloaderApp:
 
                         download_previews()
 
-                        def tianji_similarity(anchor, candidate) -> bool:
+                        def require_similarity_previews(anchor, candidate, prefix: str = "") -> None:
                             nonlocal preview_messages, preview_started, preview_done, preview_total
                             required = [*anchor, *candidate]
-                            preview_messages = {message.id: message for message in required
-                                                if message.id not in preview_cache}
-                            if preview_messages:
+                            missing = [message for message in required if not preview_cache.get(message.id)]
+                            if missing:
+                                preview_messages = {message.id: message for message in missing}
                                 preview_started = time.monotonic()
                                 preview_done = 0
                                 preview_total = len(preview_messages)
                                 self.set_progress(0, preview_total, f"相似度补图：0 / {preview_total}",
                                                   phase_started=preview_started)
                                 download_previews()
-                            missing = [message.id for message in required if not preview_cache.get(message.id)]
-                            if missing:
-                                raise OcrError(f"天机阁相似度检查图片缺失：{missing}；本次任务已中止")
+                            still_missing = [message.id for message in required if not preview_cache.get(message.id)]
+                            if still_missing:
+                                raise OcrError(f"{prefix}相似度检查图片缺失：{still_missing}；本次任务已中止")
+
+                        def tianji_similarity(anchor, candidate) -> bool:
+                            require_similarity_previews(anchor, candidate, "天机阁")
                             return image_groups_are_similar(
                                 [preview_cache[message.id] for message in anchor],
                                 [preview_cache[message.id] for message in candidate],
                                 min_intersection=TIANJI_MIN_COLOR_INTERSECTION,
                                 max_aspect_ratio=TIANJI_MAX_ASPECT_RATIO,
+                            )
+
+                        def adjacent_similarity(anchor, candidate) -> bool:
+                            require_similarity_previews(anchor, candidate)
+                            return image_groups_are_similar(
+                                [preview_cache[message.id] for message in anchor],
+                                [preview_cache[message.id] for message in candidate],
                             )
 
                         if visual_adjacent_labels or first_image_ocr_labels:
@@ -3174,10 +3900,7 @@ class TelegramDownloaderApp:
                                 bidirectional_adjacent_labels=bidirectional_labels,
                                 exact_labels=exact_labels,
                                 similarity_labels=visual_adjacent_labels,
-                                group_similarity=lambda anchor, candidate: image_groups_are_similar(
-                                    [preview_cache[message.id] for message in anchor if message.id in preview_cache],
-                                    [preview_cache[message.id] for message in candidate if message.id in preview_cache],
-                                ),
+                                group_similarity=adjacent_similarity,
                                 log=self.log,
                             )
                         checked_pairs: set[tuple[int, int]] = set()
@@ -3242,7 +3965,7 @@ class TelegramDownloaderApp:
                                 ),
                             )
                             for label, ids in ignored_ids.items():
-                                ignored_note_ids[label].update(ids)
+                                ignored_note_ids[label].update((chat_address, message_id) for message_id in ids)
                     return selection, preview_cache
 
                 matched_total = 0
@@ -3264,10 +3987,35 @@ class TelegramDownloaderApp:
                     self.log(f"【状态】全量抓取覆盖本日期结果目录：{group_output}")
                     shutil.rmtree(group_output)
                 group_output.mkdir(parents=True, exist_ok=True)
+                if legacy_migration:
+                    # 多链接群旧状态属于一次重建：旧文件与旧报告都无法确认来源，不猜来源，
+                    # 统一移入 _旧文件未映射（保留原文件名）后按来源标识重新下载、重建报告。
+                    unmapped_root = group_output / UNMAPPED_LEGACY_DIR
+                    old_report = group_output / "提取报告.csv"
+                    if old_report.is_file():
+                        unmapped_root.mkdir(parents=True, exist_ok=True)
+                        os.replace(old_report, unmapped_root / "提取报告-旧格式备份.csv")
+                        self.log(f"【迁移】多链接群旧状态：旧报告无法确认来源，已备份为 "
+                                 f"{UNMAPPED_LEGACY_DIR}/提取报告-旧格式备份.csv")
+                    moved_legacy = 0
+                    for candidate in sorted(group_output.rglob("*")):
+                        if not candidate.is_file() or unmapped_root in candidate.parents:
+                            continue
+                        if not LEGACY_FILENAME_PATTERN.fullmatch(candidate.name):
+                            continue
+                        target_dir = unmapped_root / candidate.parent.name
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        os.replace(candidate, target_dir / candidate.name)
+                        moved_legacy += 1
+                        self.log(f"【迁移】来源数量 {len(source_order)}；旧文件 {candidate.name} 未自动归属 → "
+                                 f"{UNMAPPED_LEGACY_DIR}/{candidate.parent.name}/")
+                    if moved_legacy:
+                        self.log(f"【迁移】多链接群旧状态：{moved_legacy} 个旧文件未自动归属，"
+                                 "本次按来源标识重新下载并重建报告")
                 counts: Counter[str] = Counter()
-                downloaded_ids: set[int] = set()
-                successful_label_ids: dict[str, set[int]] = defaultdict(set)
-                failed_label_ids: dict[str, set[int]] = defaultdict(set)
+                downloaded_ids: set[MessageKey] = set()
+                successful_label_ids: dict[str, set[MessageKey]] = defaultdict(set)
+                failed_label_ids: dict[str, set[MessageKey]] = defaultdict(set)
                 processed = 0
                 rows = []
                 file_outcomes: Counter[str] = Counter()
@@ -3278,45 +4026,84 @@ class TelegramDownloaderApp:
                 async def download_selected() -> None:
                     semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 
-                    async def download_message(message, labels: set[str], preview_cache: dict[int, bytes]) -> None:
+                    async def download_message(
+                        address: str, message, labels: set[str], preview_cache: dict[int, bytes]
+                    ) -> None:
                         nonlocal processed
+                        key = (address, message.id)
                         async with semaphore:
                             ext = message.file.ext if message.file else ".jpg"
                             if not ext or not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", ext):
                                 ext = ".jpg"
                             stamp = message.date.astimezone(CN_TZ).strftime("%Y%m%d_%H%M%S")
-                            filename = f"{stamp}_{message.id}{ext.lower()}"
+                            filename = f"{stamp}_{source_tag(address)}_{message.id}{ext.lower()}"
                             for label in sorted(labels):
                                 folder = group_output / safe_folder_name(label)
                                 folder.mkdir(parents=True, exist_ok=True)
                                 destination = folder / filename
-                                success = destination.exists()
+                                previously_failed = message.id in source_pending_ids.get(address, [])
+                                success = downloaded_file_is_complete(
+                                    destination, message, previously_failed=previously_failed
+                                )
                                 outcome = "已有跳过" if success else "网络下载"
-                                failure = "下载未返回文件"
-                                if not success and message.id in preview_cache:
+                                created_now = False
+                                legacy_destination = folder / f"{stamp}_{message.id}{ext.lower()}"
+                                if not success and single_source and downloaded_file_is_complete(
+                                    legacy_destination, message, previously_failed=previously_failed
+                                ):
+                                    # 单链接群旧名只可能属于这个来源：迁移成带来源标识的文件名，不重新下载。
+                                    # 多链接群不做这种归属猜测，旧文件由 _旧文件未映射 统一接管。
                                     try:
-                                        destination.write_bytes(preview_cache[message.id])
+                                        os.replace(legacy_destination, destination)
                                         success = True
-                                        outcome = "预览复用"
+                                        outcome = "已有跳过"
+                                        created_now = True
+                                        self.log(f"【下载】旧文件名迁移：{legacy_destination.name} → {filename}")
                                     except OSError as exc:
-                                        self.log(f"【下载】预览保存失败，尝试正常下载：消息 {message.id}（{type(exc).__name__}: {exc}）")
+                                        self.log(f"【下载】旧文件名迁移失败：{legacy_destination.name}"
+                                                 f"（{type(exc).__name__}: {exc}）")
+                                failure = "下载未返回文件"
                                 if not success:
+                                    temporary = destination.with_suffix(destination.suffix + ".part")
                                     try:
-                                        success = bool(await message.download_media(file=str(destination)))
+                                        if message.id in preview_cache:
+                                            try:
+                                                temporary.write_bytes(preview_cache[message.id])
+                                                success = downloaded_file_is_complete(temporary, message)
+                                                if success:
+                                                    outcome = "预览复用"
+                                            except OSError as exc:
+                                                self.log(f"【下载】预览保存失败，尝试正常下载：消息 {message.id}（{type(exc).__name__}: {exc}）")
+                                        if not success:
+                                            returned = await message.download_media(file=str(temporary))
+                                            success = bool(returned) and downloaded_file_is_complete(temporary, message)
+                                            if not success:
+                                                failure = "下载未生成完整文件"
+                                        if success:
+                                            os.replace(temporary, destination)
+                                            created_now = True
                                     except Exception as exc:
+                                        success = False
                                         failure = f"{type(exc).__name__}: {exc}"
+                                    finally:
+                                        try:
+                                            temporary.unlink(missing_ok=True)
+                                        except OSError as exc:
+                                            self.log(f"【下载】临时文件清理失败：{temporary.name}（{exc}）")
                                 if not success:
-                                    failed_label_ids[label].add(message.id)
+                                    failed_label_ids[label].add(key)
                                     file_outcomes["失败"] += 1
                                     self.log(f"【下载】失败：来源 {message_sources.get(id(message))} 备注 {label} 消息 {message.id}（{failure}）")
                                     continue
                                 file_outcomes[outcome] += 1
-                                successful_label_ids[label].add(message.id)
-                                downloaded_ids.add(message.id)
+                                successful_label_ids[label].add(key)
+                                downloaded_ids.add(key)
                                 counts[label] += 1
-                                rows.append(
-                                    [label, message.id, message.date.astimezone(CN_TZ).isoformat(), str(destination)]
-                                )
+                                if created_now:
+                                    rows.append(
+                                        [label, address, message.id,
+                                         message.date.astimezone(CN_TZ).isoformat(), str(destination)]
+                                    )
                                 self.log(f"【下载】{outcome}：来源 {message_sources.get(id(message))}；{label} → {filename}")
                             processed += 1
                             self.set_progress(
@@ -3330,7 +4117,7 @@ class TelegramDownloaderApp:
                         source_cache = source_preview_caches.get(address, {})
                         await asyncio.gather(
                             *(
-                                download_message(message, source_selection[message.id], source_cache)
+                                download_message(address, message, source_selection[message.id], source_cache)
                                 for message in source_media.get(address, [])
                                 if message.id in source_selection
                             )
@@ -3351,17 +4138,32 @@ class TelegramDownloaderApp:
 
                 self.set_progress(0, 0, "保存结果与抓取状态…")
                 report = group_output / "提取报告.csv"
-                append_report = incremental and report.is_file() and report.stat().st_size > 0
-                with report.open("a" if append_report else "w", newline="", encoding="utf-8-sig") as handle:
-                    writer = csv.writer(handle)
-                    if not append_report:
-                        writer.writerow(["备注", "消息ID", "北京时间", "本地文件"])
-                    writer.writerows(rows)
-                self.log(f"【状态】提取报告已{'追加' if append_report else '保存'}：{report}")
+                # 多来源旧状态迁移走重建报告：旧报告已备份，来源不明确的行不参与去重也不伪造来源。
+                append_report = (
+                    incremental and not legacy_migration and report.is_file() and report.stat().st_size > 0
+                )
+                existing_report_keys = set() if legacy_migration else read_report_keys(report)
+                new_rows = []
+                for row in rows:
+                    row_key = report_row_key(row)
+                    if row_key in existing_report_keys:
+                        continue
+                    existing_report_keys.add(row_key)
+                    new_rows.append(row)
+                if append_report and not new_rows:
+                    self.log(f"【状态】提取报告无新增行：{report}")
+                else:
+                    with report.open("a" if append_report else "w", newline="", encoding="utf-8-sig") as handle:
+                        writer = csv.writer(handle)
+                        if not append_report:
+                            writer.writerow(REPORT_HEADER)
+                        writer.writerows(new_rows)
+                    self.log(f"【状态】提取报告已{'追加' if append_report else '保存'}：{report}"
+                             + (f"；新增 {len(new_rows)} 行" if append_report else ""))
 
                 labels = list(dict.fromkeys(all_labels))
-                note_matches: dict[str, set[int]] = defaultdict(set)
-                broad_exact_matches: dict[str, set[int]] = defaultdict(set)
+                note_matches: dict[str, set[MessageKey]] = defaultdict(set)
+                broad_exact_matches: dict[str, set[MessageKey]] = defaultdict(set)
                 for address in source_order:
                     source_notes_map = source_scan_notes.get(address, {})
                     source_exact = source_exact_labels.get(address, set())
@@ -3369,30 +4171,34 @@ class TelegramDownloaderApp:
                     for label, ids in build_note_message_ids(
                         source_all, source_notes_map, exact_labels=source_exact
                     ).items():
-                        note_matches[label].update(ids)
+                        note_matches[label].update((address, message_id) for message_id in ids)
                     narrow_notes = {
                         keyword: label for keyword, label in source_notes_map.items() if label in source_exact
                     }
                     for label, ids in build_note_message_ids(source_all, narrow_notes).items():
-                        broad_exact_matches[label].update(ids)
+                        broad_exact_matches[label].update((address, message_id) for message_id in ids)
                 note_matches = dict(note_matches)
                 broad_exact_matches = dict(broad_exact_matches)
                 for label, ignored_message_ids in ignored_note_ids.items():
                     if label in note_matches:
                         note_matches[label] -= ignored_message_ids
-                selected_label_ids: dict[str, set[int]] = defaultdict(set)
-                for source_selection in source_selections.values():
+                selected_label_ids: dict[str, set[MessageKey]] = defaultdict(set)
+                for address, source_selection in source_selections.items():
                     for message_id, selected_labels in source_selection.items():
                         for label in selected_labels:
-                            selected_label_ids[label].add(message_id)
+                            selected_label_ids[label].add((address, message_id))
                 previous_remarks = (previous_status or {}).get("remarks", {}) if incremental else {}
                 remarks = {}
                 for label in labels:
                     previous = previous_remarks.get(label, {})
-                    previous_image_ids = {int(item) for item in previous.get("image_message_ids", [])}
+                    previous_image_ids = remark_message_keys(
+                        previous, "image_messages", "image_message_ids", source_order
+                    )
                     current_image_ids = successful_label_ids.get(label, set())
                     image_ids = previous_image_ids | current_image_ids
-                    previous_pending = {int(item) for item in previous.get("pending_message_ids", [])}
+                    previous_pending = remark_message_keys(
+                        previous, "pending_messages", "pending_message_ids", source_order
+                    )
                     # Retire only reread captions rejected by the exact rule, not missing
                     # messages or failed album/OCR selections with an empty caption.
                     retired_pending = (
@@ -3401,14 +4207,15 @@ class TelegramDownloaderApp:
                     if retired_pending:
                         previous_pending -= retired_pending
                         self.log(f"【状态】{label}：已重新核验并移除不符合精准备注规则的旧待抓消息 "
-                                 f"{sorted(retired_pending)}；保留未读到和真实失败项")
+                                 f"{format_message_keys(retired_pending)}；保留未读到和真实失败项")
                     pending_ids = (
                         previous_pending
                         | note_matches.get(label, set())
                         | failed_label_ids.get(label, set())
                     ) - image_ids
-                    previous_count = int(previous.get("image_count", 0) or 0)
-                    image_count = max(previous_count, len(image_ids))
+                    # 多链接群旧数量（纯数字ID）无法映射到来源：不继承，只按来源级引用计数。
+                    previous_count = 0 if legacy_migration else int(previous.get("image_count", 0) or 0)
+                    image_count = max(previous_count, len(image_ids)) if not legacy_migration else len(image_ids)
                     if pending_ids and image_count:
                         status = "部分完成"
                     elif pending_ids:
@@ -3420,8 +4227,8 @@ class TelegramDownloaderApp:
                     remarks[label] = {
                         "status": status,
                         "image_count": image_count,
-                        "image_message_ids": sorted(image_ids),
-                        "pending_message_ids": sorted(pending_ids),
+                        "image_messages": message_refs(image_ids),
+                        "pending_messages": message_refs(pending_ids),
                     }
 
                 if status_enabled:
@@ -3452,20 +4259,41 @@ class TelegramDownloaderApp:
                     unmatched = [label for label in labels if counts[label] == 0]
                 (group_output / "未匹配备注.txt").write_text("\n".join(unmatched), encoding="utf-8-sig")
                 self.log(f"【汇总】待补抓备注（{len(unmatched)}）：{'、'.join(unmatched) or '无'}")
-                return (
+                return CaptureResult(
                     scanned,
                     len(downloaded_ids),
                     len(unmatched),
                     matched_total,
                     group_output,
                     time.monotonic() - operation_started,
+                    discovered_images,
+                    failed_images=len(set().union(*failed_label_ids.values())),
                 )
 
-        def success(result: tuple[int, int, int, int, Path, float]) -> None:
-            scanned, downloaded, unmatched, matched_total, result_path, total_elapsed = result
+        def success(result: CaptureResult) -> None:
+            scanned, downloaded, unmatched, matched_total, result_path, total_elapsed = result[:6]
             self._stop_capture_progress()
+            if scheduled:
+                self._finish_auto_capture(result)
+                return
+            if (
+                not self._workflow_mode
+                and notes_override is None
+                and not result.failed_images
+                and not result.unmatched
+            ):
+                try:
+                    recorded = record_manual_capture(
+                        manual_capture_log_path(self.status_root), group_name, target_day
+                    )
+                    if recorded:
+                        self.log(f"【手动抓取】{group_name} 已完成 {target_day.isoformat()}，当天自动抓取跳过")
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    self.log(f"【手动抓取】{group_name} 完成记录保存失败，自动抓取未跳过：{exc}")
             self.update_first_capture_status()
             self.task_status.set(
+                f"部分完成：成功 {downloaded} 张，下载失败 {result.failed_images} 张，请同日复抓"
+                if result.failed_images else
                 f"完成：{matched_total} / {matched_total}｜总耗时 {format_duration(total_elapsed)}"
             )
             self.log(f"【汇总】完成：扫描 {scanned} 条，成功处理 {downloaded} 张（含已有文件），未完成备注 {unmatched} 条；"
@@ -3475,11 +4303,269 @@ class TelegramDownloaderApp:
             else:
                 messagebox.showinfo(
                     "复抓完成" if retry else "提取完成",
-                    f"扫描消息：{scanned}\n提取图片：{downloaded}\n未匹配备注：{unmatched}\n\n结果：{result_path}",
+                    f"扫描消息：{scanned}\n提取图片：{downloaded}\n下载失败：{result.failed_images}\n未匹配备注：{unmatched}\n\n结果：{result_path}",
                 )
 
         self._start_capture_progress()
-        self.run_worker(operation, success)
+        self.run_worker(
+            operation,
+            success,
+            on_failure=self._auto_capture_failure if scheduled else None,
+        )
+
+
+class AutoCaptureSettingsDialog:
+    """Per-group same-day schedule and minimum-image configuration."""
+
+    def __init__(self, app: TelegramDownloaderApp):
+        self.app = app
+        self.selected_name = ""
+        self.window = Toplevel(app.root)
+        self.window.title("自动抓取设置")
+        self.window.configure(background=DARK_BG)
+        self.window.transient(app.root)
+        self.window.grab_set()
+        self.window.protocol("WM_DELETE_WINDOW", self._close_window)
+        self.window.after_idle(lambda: app._enable_dark_title_bar(self.window))
+
+        frame = ttk.Frame(self.window, padding=18)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+        title_row = ttk.Frame(frame)
+        title_row.grid(row=0, column=0, sticky="ew")
+        ttk.Label(title_row, text="按群设置每日自动抓取", style="Section.TLabel").pack(side="left")
+        actions = ttk.Frame(title_row)
+        actions.pack(side="right")
+        self.save_button = ttk.Button(
+            actions, text="保存当前群设置", style="Accent.TButton", command=self.save_item
+        )
+        self.save_button.pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="关闭", command=self._close_window).pack(side="left")
+        self.save_feedback = StringVar(master=self.window)
+        ttk.Label(frame, textvariable=self.save_feedback, style="Hint.TLabel", wraplength=940).grid(
+            row=1, column=0, sticky="w", pady=(5, 0)
+        )
+
+        content_shell = ttk.Frame(frame)
+        content_shell.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        content_shell.columnconfigure(0, weight=1)
+        content_shell.rowconfigure(0, weight=1)
+        canvas = Canvas(content_shell, background=DARK_BG, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(content_shell, orient="vertical", command=canvas.yview)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        self._scroll_canvas = canvas
+        content = ttk.Frame(canvas)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def update_scroll_region(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_content_width(event) -> None:
+            canvas.itemconfigure(content_window, width=event.width)
+
+        content.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", fit_content_width)
+
+        def scroll_with_wheel(event) -> None:
+            delta = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(delta, "units")
+
+        canvas.bind_all("<MouseWheel>", scroll_with_wheel, add="+")
+        ttk.Label(
+            content,
+            text="软件保持打开时生效。每个群每天最多扫描两次；第一次达到最低图片数量后立即进入正常提取，低于最低数量才等待第二次。两次扫描数量分别判断，不累加。",
+            style="Hint.TLabel",
+            wraplength=960,
+        ).pack(anchor="w", pady=(0, 14))
+
+        self.tree = ttk.Treeview(
+            content,
+            columns=("name", "enabled", "first", "second", "minimum", "last"),
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        headings = {
+            "name": "群组",
+            "enabled": "状态",
+            "first": "第一次",
+            "second": "第二次",
+            "minimum": "最低图片数",
+            "last": "上次最终发现",
+        }
+        widths = {"name": 220, "enabled": 90, "first": 100, "second": 100, "minimum": 120, "last": 140}
+        for column, heading in headings.items():
+            self.tree.heading(column, text=heading)
+            self.tree.column(column, width=widths[column], anchor="center" if column != "name" else "w")
+        self.tree.pack(fill="x", expand=False, pady=(0, 14))
+        self.tree.bind("<<TreeviewSelect>>", self.select_item)
+
+        form = ttk.Frame(content, style="Card.TFrame", padding=16)
+        form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
+        self.enabled = BooleanVar(master=self.window, value=False)
+        self.first_time = StringVar(master=self.window)
+        self.second_time = StringVar(master=self.window)
+        self.min_images = StringVar(master=self.window, value="0")
+        self.last_discovered = StringVar(master=self.window, value="未扫描")
+        self.last_discovered_date = StringVar(master=self.window, value="")
+        ttk.Checkbutton(form, text="启用每日自动抓取", variable=self.enabled).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 9)
+        )
+        ttk.Label(form, text="第一次开始时间", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=5, padx=(0, 12))
+        ttk.Entry(form, textvariable=self.first_time, style="Dark.TEntry", font=FORM_FONT, width=12).grid(
+            row=1, column=1, sticky="w", pady=5
+        )
+        ttk.Label(form, text="第二次开始时间", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=5, padx=(0, 12))
+        ttk.Entry(form, textvariable=self.second_time, style="Dark.TEntry", font=FORM_FONT, width=12).grid(
+            row=2, column=1, sticky="w", pady=5
+        )
+        ttk.Label(form, text="最低发现图片数", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=5, padx=(0, 12))
+        ttk.Entry(form, textvariable=self.min_images, style="Dark.TEntry", font=FORM_FONT, width=12).grid(
+            row=3, column=1, sticky="w", pady=5
+        )
+        ttk.Label(form, text="上次最终发现数量", style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=5, padx=(0, 12))
+        ttk.Entry(
+            form, textvariable=self.last_discovered, state="readonly", style="Dark.TEntry", font=FORM_FONT, width=12
+        ).grid(row=4, column=1, sticky="w", pady=5)
+        ttk.Label(form, textvariable=self.last_discovered_date, style="CardHint.TLabel").grid(
+            row=4, column=1, sticky="w", padx=(150, 0)
+        )
+        ttk.Label(
+            form,
+            text="启用时必须填写 HH:MM，第二次时间必须晚于第一次；数量按“发现图片数 ≥ 最低图片数”判断。",
+            style="CardHint.TLabel",
+            wraplength=900,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        self.refresh()
+        self.set_busy(app._busy)
+        app._center_dialog(self.window, 1020, 720)
+
+    def set_busy(self, busy: bool) -> None:
+        self.save_button.configure(state="disabled" if busy else "normal")
+        if busy:
+            self.save_feedback.set("抓取进行中，暂不能保存；任务结束后可保存当前修改。")
+        elif self.save_feedback.get().startswith("抓取进行中"):
+            self.save_feedback.set("任务已结束，可以保存当前修改。")
+
+    def refresh_result(self, group_name: str) -> None:
+        profile = next((item for item in self.app.settings["groups"] if item["name"] == group_name), None)
+        if profile is None:
+            return
+        config = get_auto_capture_settings(profile)
+        last = config["last_discovered_images"]
+        if self.tree.exists(group_name):
+            self.tree.set(group_name, "last", last if last is not None else "未扫描")
+        if self.selected_name == group_name:
+            self.last_discovered.set(str(last) if last is not None else "未扫描")
+            self.last_discovered_date.set(f"（{config['last_discovered_date']}）" if config["last_discovered_date"] else "")
+
+    def _close_window(self) -> None:
+        canvas = getattr(self, "_scroll_canvas", None)
+        if canvas is not None:
+            canvas.unbind_all("<MouseWheel>")
+        if self.window.winfo_exists():
+            self.window.destroy()
+
+    def refresh(self, selected: str = "") -> None:
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        selected_name = selected or self.selected_name
+        selected_id = None
+        for profile in self.app.settings.get("groups", []):
+            config = get_auto_capture_settings(profile)
+            last = config["last_discovered_images"]
+            item_id = self.tree.insert(
+                "",
+                "end",
+                iid=profile["name"],
+                values=(
+                    profile["name"],
+                    "开启" if config["enabled"] else "关闭",
+                    config["first_time"] or "—",
+                    config["second_time"] or "—",
+                    config["min_images"],
+                    last if last is not None else "未扫描",
+                ),
+            )
+            if profile["name"] == selected_name:
+                selected_id = item_id
+        if selected_id:
+            self.tree.selection_set(selected_id)
+            self.tree.focus(selected_id)
+            self.tree.see(selected_id)
+        elif self.tree.get_children() and not self.selected_name:
+            first = self.tree.get_children()[0]
+            self.tree.selection_set(first)
+            self.tree.focus(first)
+
+    def select_item(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        name = str(self.tree.item(selection[0], "values")[0])
+        profile = next((item for item in self.app.settings.get("groups", []) if item["name"] == name), None)
+        if profile is None:
+            return
+        config = get_auto_capture_settings(profile)
+        self.selected_name = name
+        self.enabled.set(config["enabled"])
+        self.first_time.set(config["first_time"])
+        self.second_time.set(config["second_time"])
+        self.min_images.set(str(config["min_images"]))
+        self.last_discovered.set(
+            str(config["last_discovered_images"]) if config["last_discovered_images"] is not None else "未扫描"
+        )
+        self.last_discovered_date.set(
+            f"（{config['last_discovered_date']}）" if config["last_discovered_date"] else ""
+        )
+
+    def save_item(self) -> None:
+        if self.app._busy:
+            self.set_busy(True)
+            return
+        if not self.selected_name:
+            messagebox.showwarning("请选择群组", "请先在上方列表选择一个群组", parent=self.window)
+            return
+        profile = next(
+            (item for item in self.app.settings.get("groups", []) if item["name"] == self.selected_name),
+            None,
+        )
+        if profile is None:
+            messagebox.showwarning("群组不存在", "当前群组配置已被删除，请刷新后重试", parent=self.window)
+            return
+        try:
+            raw_minimum = self.min_images.get().strip()
+            if not raw_minimum.isascii() or not raw_minimum.isdigit():
+                raise ValueError("最低图片数量必须是大于等于 0 的整数")
+            old_config = get_auto_capture_settings(profile)
+            config = normalize_auto_capture_settings({
+                "enabled": bool(self.enabled.get()),
+                "first_time": self.first_time.get().strip(),
+                "second_time": self.second_time.get().strip(),
+                "min_images": int(raw_minimum),
+                "last_discovered_images": old_config["last_discovered_images"],
+                "last_discovered_date": old_config["last_discovered_date"],
+                "first_attempt_date": old_config["first_attempt_date"],
+                "second_attempt_date": old_config["second_attempt_date"],
+                "threshold_met_date": old_config["threshold_met_date"],
+                "captured_date": old_config["captured_date"],
+            })
+        except ValueError as exc:
+            messagebox.showwarning("无法保存", str(exc), parent=self.window)
+            return
+        try:
+            save_auto_capture_settings(self.app.program_root, self.app.settings, profile, config)
+        except (OSError, ValueError) as exc:
+            messagebox.showwarning("无法保存", str(exc), parent=self.window)
+            return
+        self.app.log(f"【自动抓取】已保存群设置：{self.selected_name}")
+        self.save_feedback.set(f"已保存：{self.selected_name}")
+        self.refresh(self.selected_name)
 
 
 class GroupSettingsDialog:
