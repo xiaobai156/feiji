@@ -589,7 +589,8 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(load_group_notes(path), ({"战狼": "战狼"}, {}))
 
     def test_window_preset_round_trip_and_validation(self):
-        self.assertEqual(WINDOW_PRESETS, {"2k": (1440, 860), "1080": (1440, 860)})
+        self.assertEqual(WINDOW_PRESETS, {"2k": (1600, 960), "1080": (1440, 860)})
+        self.assertNotEqual(WINDOW_PRESETS["2k"], WINDOW_PRESETS["1080"])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.assertEqual(load_window_preset(root), "")
@@ -1484,7 +1485,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.2")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.3")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -1599,7 +1600,8 @@ class GuiFlowTests(unittest.TestCase):
             begin.assert_not_called()
             self.app._check_auto_capture_schedule(second_time + timedelta(days=1))
             self.assertEqual(begin.call_count, 1)
-            self.assertEqual(begin.call_args.args[2:], (1, today + timedelta(days=1)))
+            # 已过第二次时间才启动：直接按第 2 次只跑一轮，不再连跑两次全量扫描。
+            self.assertEqual(begin.call_args.args[2:], (2, today + timedelta(days=1)))
 
     def test_auto_capture_keeps_manual_skip_when_expired_log_cleanup_cannot_write(self):
         save_group_profile(self.app.program_root, self.app.settings, "", "自动群", "@auto")
@@ -2030,14 +2032,49 @@ class GuiFlowTests(unittest.TestCase):
     def test_login_watchdog_recovers_busy_ui_once(self):
         self.app.set_busy(True, "准备中…")
         self.app._login_token = "token-a"
+        self.app._login_in_progress = True
         with patch.object(self.app, "open_login_settings") as opener:
             self.app._login_watchdog("token-stale")
             self.assertIn("准备中", self.app.task_status.get())
-            self.app._login_watchdog("token-a")
+            # 到达重排上限后强制恢复界面
+            self.app._login_watchdog("token-a", gui.LOGIN_WATCHDOG_MAX_CHECKS)
         self.assertEqual(self.app._login_token, "")
         self.assertIn("登录超时", self.app.task_status.get())
         self.assertFalse(self.app._busy)
+        self.assertFalse(self.app._login_in_progress)
         opener.assert_called_once()
+
+    def test_login_watchdog_ignores_finished_login(self):
+        self.app.set_busy(True, "导入中…")
+        self.app._login_token = "token-a"
+        self.app._login_in_progress = False
+        try:
+            with patch.object(self.app, "open_login_settings") as opener:
+                self.app._login_watchdog("token-a")
+            # 登录已结束（token 已清）时，看门狗不能去解锁别的任务
+            self.assertTrue(self.app._busy)
+            opener.assert_not_called()
+        finally:
+            self.app.set_busy(False)
+
+    def test_login_watchdog_keeps_ui_locked_while_login_worker_alive(self):
+        self.app.set_busy(True, "准备中…")
+        self.app._login_token = "token-a"
+        self.app._login_in_progress = True
+        scheduled = []
+        original_after = self.app.root.after
+        self.app.root.after = lambda delay, callback=None, *args: (scheduled.append(delay), "id")[1]
+        try:
+            with patch.object(self.app, "open_login_settings") as opener:
+                self.app._login_watchdog("token-a")
+            self.assertTrue(self.app._busy)
+            opener.assert_not_called()
+            self.assertIn(60000, scheduled)
+            self.assertEqual(self.app._login_token, "token-a")
+        finally:
+            self.app.root.after = original_after
+            self.app._login_in_progress = False
+            self.app.set_busy(False)
 
     def test_login_failure_opens_account_window(self):
         original_after = self.app.root.after
@@ -2404,7 +2441,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app.root.after = original_after
         self.assertEqual(successes, [42])
 
-    def test_clear_output_removes_contents_without_confirmation_and_keeps_folder(self):
+    def test_clear_output_asks_confirmation_and_keeps_folder_when_cancelled(self):
         output = Path(self.app_directory.name) / "result"
         nested = output / "测试群" / "大小姐"
         nested.mkdir(parents=True)
@@ -2412,13 +2449,39 @@ class GuiFlowTests(unittest.TestCase):
         (output / "提取报告.csv").write_text("report", encoding="utf-8")
         self.app.output_path.set(str(output))
 
-        with patch("telegram_caption_downloader_gui.messagebox.askyesno") as askyesno:
+        with patch("telegram_caption_downloader_gui.messagebox.askyesno", return_value=False) as askyesno:
             self.app.clear_output()
 
-        askyesno.assert_not_called()
+        askyesno.assert_called_once()
+        self.assertTrue((nested / "image.jpg").is_file())
+        self.assertTrue((output / "提取报告.csv").is_file())
+
+        with patch("telegram_caption_downloader_gui.messagebox.askyesno", return_value=True) as askyesno:
+            self.app.clear_output()
+
+        askyesno.assert_called_once()
         self.assertTrue(output.is_dir())
         self.assertEqual(list(output.iterdir()), [])
         self.assertEqual(self.app.task_status.get(), "已清除结果：2 项")
+
+    def test_clear_output_refuses_when_date_is_invalid(self):
+        output = Path(self.app_directory.name) / "result-invalid-date"
+        group_dir = output / "9.2-测试群"
+        group_dir.mkdir(parents=True)
+        (group_dir / "a.jpg").write_bytes(b"x")
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@a")
+        self.app.reload_group_profiles("测试群")
+        self.app.output_path.set(str(output))
+        self.app.day.set("2026/10/05")
+        with (
+            patch("telegram_caption_downloader_gui.messagebox.showwarning") as warning,
+            patch("telegram_caption_downloader_gui.messagebox.askyesno") as askyesno,
+        ):
+            self.app.clear_output()
+        warning.assert_called_once()
+        askyesno.assert_not_called()
+        # 日期非法时不能回退成清除整个结果根目录。
+        self.assertTrue((group_dir / "a.jpg").is_file())
 
     def test_secret_prompt_and_invalid_actions_are_handled(self):
         original_after = self.app.root.after
@@ -3250,8 +3313,9 @@ class GuiFlowTests(unittest.TestCase):
         self.assertCountEqual(ocr_calls, [payloads[message_id] for message_id in (3, 5, 7, 11, 13, 15, 17)])
         self.assertEqual(similarity.call_count, 5)
         for call in similarity.call_args_list:
-            self.assertEqual(call.kwargs, dict(min_intersection=TIANJI_MIN_COLOR_INTERSECTION,
-                                               max_aspect_ratio=TIANJI_MAX_ASPECT_RATIO))
+            self.assertEqual(set(call.kwargs), {"min_intersection", "max_aspect_ratio", "log"})
+            self.assertEqual(call.kwargs["min_intersection"], TIANJI_MIN_COLOR_INTERSECTION)
+            self.assertEqual(call.kwargs["max_aspect_ratio"], TIANJI_MAX_ASPECT_RATIO)
         output = root / "results" / "9.2-嫣然心水" / "天机阁杀料"
         self.assertEqual(len(list(output.glob("*.jpg"))), 12)
         status = load_capture_status(capture_status_path(self.app.status_root, "嫣然心水"))
@@ -4531,7 +4595,8 @@ class CaptureRecoveryTests(unittest.TestCase):
             self.assertEqual(remark["image_messages"], [{"source": "@b", "id": 1}])
             first.fail = False
             self.app.start_download(retry=True)
-            self.assertEqual((first.calls, second.calls), (2, 1))
+            # 失败的那次会先重试一遍（2 次），复抓再成功一次，共 3 次；未失败的来源始终 1 次。
+            self.assertEqual((first.calls, second.calls), (3, 1))
             self.assertEqual(results[-1].failed_images, 0)
             self.assertEqual(self.status()["remarks"]["全部图片"]["status"], "已完成")
 
@@ -4544,7 +4609,7 @@ class CaptureRecoveryTests(unittest.TestCase):
             save_capture_status(capture_status_path(self.app.status_root, "Recovery"), status)
             message.fail = False
             self.app.start_download(retry=True)
-            self.assertEqual(message.calls, 2)
+            self.assertEqual(message.calls, 3)
             self.assertEqual(self.status()["remarks"]["全部图片"]["image_count"], 1)
 
     def test_failed_download_never_publishes_partial_and_repairs_old_partial_on_retry(self):
@@ -4560,7 +4625,7 @@ class CaptureRecoveryTests(unittest.TestCase):
             old.write_bytes(b"partial")
             message.fail = message.partial = False
             self.app.start_download(retry=True)
-            self.assertEqual(message.calls, 2)
+            self.assertEqual(message.calls, 3)
             self.assertEqual(old.read_bytes(), b"complete-image")
             self.assertEqual(self.status()["remarks"]["known"]["status"], "已完成")
 
@@ -4646,6 +4711,316 @@ class CaptureRecoveryTests(unittest.TestCase):
             self.assertEqual(saved["min_images"], 900)
             self.assertEqual(saved["threshold_met_date"], self.day.isoformat())
             self.assertIn("已保存", dialog.save_feedback.get())
+
+
+    def test_subset_retry_keeps_other_downloads_and_report_rows(self):
+        known, other = self.message(1), self.message(2)
+        other.raw_text = "other"
+        with self.capture({"@a": [known, other]}, ["known", "other"]):
+            self.app.start_download()
+            output = dated_group_output(Path(self.app.output_path.get()), self.day, "Recovery")
+            other_file = next((output / "other").glob("*.jpg"))
+            before_rows = read_report(output / "提取报告.csv")
+            self.assertEqual(len(before_rows), 3)
+
+            self.app.start_download(notes_override={"known": "known"}, retry=True)
+
+            # 指定备注复抓只补这些备注，绝不能删掉当天其它备注的图片与报告行。
+            self.assertTrue(other_file.is_file())
+            after_rows = read_report(output / "提取报告.csv")
+            self.assertEqual(len(after_rows), len(before_rows))
+            self.assertEqual([row[0] for row in after_rows[1:]], ["known", "other"])
+            keys = [tuple(row) for row in after_rows[1:]]
+            self.assertEqual(len(keys), len(set(keys)))
+
+
+    def test_extract_report_merges_path_rewrite_without_duplicating_the_image(self):
+        group_output = Path(self.fixture.app_directory.name) / "报告合并"
+        folder = group_output / "战狼"
+        folder.mkdir(parents=True)
+        legacy_name = "20261005_120000_1.jpg"
+        new_name = "20261005_120000_abcd1234_1.jpg"
+        report = group_output / "提取报告.csv"
+        report.write_text(
+            "备注,消息ID,北京时间,本地文件\n"
+            f"战狼,1,2026-10-05T12:00:00+08:00,{folder / legacy_name}\n",
+            encoding="utf-8-sig",
+        )
+        migrated = {("战狼", legacy_name): str(folder / new_name)}
+        rows = [["战狼", "@a", 1, "2026-10-05T12:00:00+08:00", str(folder / new_name)]]
+
+        self.app._write_extract_report(report, group_output, rows, False, True, migrated)
+
+        result = read_report(report)
+        self.assertEqual(len(result), 2)  # 表头 + 1 行
+        self.assertEqual(result[1][1], "@a")
+        self.assertTrue(result[1][4].endswith(new_name))
+        self.assertEqual(len({tuple(row) for row in result[1:]}), 1)
+
+    def test_extract_report_keeps_legacy_report_when_no_new_rows(self):
+        group_output = Path(self.fixture.app_directory.name) / "旧报告保留"
+        folder = group_output / "战狼"
+        folder.mkdir(parents=True)
+        report = group_output / "提取报告.csv"
+        report.write_text(
+            "备注,消息ID,北京时间,本地文件\n"
+            f"战狼,1,2026-10-05T12:00:00+08:00,{folder / 'a.jpg'}\n",
+            encoding="utf-8-sig",
+        )
+
+        # 没有本次新行：报告必须仍被写回（升级成 5 列），不能被搬成备份后就消失。
+        self.app._write_extract_report(report, group_output, [], False, True, {})
+
+        self.assertTrue(report.is_file())
+        result = read_report(report)
+        self.assertEqual(result[0], list(gui.REPORT_HEADER))
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[1][1], "")
+        self.assertEqual(result[1][2], "1")
+        backups = list(group_output.glob("提取报告-旧格式备份-*.csv"))
+        self.assertEqual(len(backups), 1)
+
+    def test_extract_report_keeps_legacy_report_when_write_fails(self):
+        group_output = Path(self.fixture.app_directory.name) / "报告写失败"
+        folder = group_output / "战狼"
+        folder.mkdir(parents=True)
+        report = group_output / "提取报告.csv"
+        original = (
+            "备注,消息ID,北京时间,本地文件\n"
+            f"战狼,1,2026-10-05T12:00:00+08:00,{folder / 'a.jpg'}\n"
+            f"68,2,2026-10-05T12:00:01+08:00,{folder / 'b.jpg'}\n"
+        )
+        report.write_text(original, encoding="utf-8-sig")
+        rows = [["战狼", "@a", 9, "2026-10-05T13:00:00+08:00", str(folder / "c.jpg")]]
+
+        with patch.object(gui, "_atomic_write_bytes", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.app._write_extract_report(report, group_output, rows, False, True, {})
+
+        # 写盘失败时原报告必须还在（备份是复制，不是搬家）。
+        self.assertTrue(report.is_file())
+        self.assertEqual(report.read_text(encoding="utf-8-sig"), original)
+
+    def test_report_write_failure_does_not_fail_the_capture(self):
+        message = self.message(1)
+        with self.capture({"@a": [message]}, ["known"]) as results:
+            self.app.start_download()
+            with patch.object(gui, "read_report_rows", side_effect=OSError("locked by excel")):
+                self.app.start_download(retry=True)
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[-1].failed_images, 0)
+            # 报告写不了，但抓取状态仍要落盘。
+            self.assertEqual(self.status()["remarks"]["known"]["status"], "已完成")
+
+    def test_run_worker_reports_when_a_task_is_already_running(self):
+        self.app.set_busy(True)
+        try:
+            self.assertFalse(self.app.run_worker(lambda: 1, lambda _result: None))
+        finally:
+            self.app.set_busy(False)
+
+    def test_run_worker_always_releases_the_ui_after_an_unhandled_exit(self):
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        def boom():
+            raise KeyboardInterrupt()
+
+        with patch("telegram_caption_downloader_gui.threading.Thread", ImmediateThread):
+            self.assertTrue(self.app.run_worker(boom, lambda _result: None))
+        self.root.update()
+        self.assertFalse(self.app._busy)
+
+
+class RiskFixRegressionTests(unittest.TestCase):
+    """回归测试：P0–P2 风险修复后的新行为。"""
+
+    @staticmethod
+    def _png_bytes():
+        payload = io.BytesIO()
+        Image.new("RGB", (4, 4), (255, 255, 255)).save(payload, format="PNG")
+        return payload.getvalue()
+
+    def test_parse_clock_rejects_non_text_instead_of_crashing(self):
+        for value in (None, 1030, ["18:00"]):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_clock(value)
+
+    def test_ocr_short_label_does_not_match_inside_longer_number(self):
+        class FakeOCR:
+            def __init__(self, *lines):
+                self.lines = list(lines)
+
+            def predict(self, image):
+                return [{"rec_texts": self.lines}]
+
+        payload = self._png_bytes()
+        self.assertEqual(ocr_labels_from_payload(payload, {"68"}, FakeOCR("168码中特")), set())
+        self.assertEqual(ocr_labels_from_payload(payload, {"68"}, FakeOCR("第68码")), {"68"})
+        self.assertEqual(ocr_labels_from_payload(payload, {"五肖"}, FakeOCR("十五肖统计")), set())
+        self.assertEqual(ocr_labels_from_payload(payload, {"五肖"}, FakeOCR("五肖统计")), {"五肖"})
+
+    def test_ocr_labels_do_not_span_two_lines(self):
+        class FakeOCR:
+            def predict(self, image):
+                return [{"rec_texts": ["小数", "双数"]}]
+
+        self.assertEqual(ocr_labels_from_payload(self._png_bytes(), {"小数双数"}, FakeOCR()), set())
+
+    def test_auto_capture_started_after_second_time_runs_only_attempt_two(self):
+        config = normalize_auto_capture_settings(dict(
+            enabled=True, first_time="18:00", second_time="22:30", min_images=1000,
+        ))
+        late = datetime(2026, 10, 3, 23, 0, tzinfo=timezone(timedelta(hours=8)))
+        self.assertEqual(auto_capture_due(config, late), 2)
+
+    def test_group_settings_reject_duplicate_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "群配置").mkdir(parents=True, exist_ok=True)
+            (root / "群配置" / "groups.json").write_text(json.dumps({
+                "groups": [
+                    {"name": "同名群", "address": "@a", "start_time": "00:00", "end_time": "23:59"},
+                    {"name": "同名群", "address": "@b", "start_time": "00:00", "end_time": "23:59"},
+                ],
+                "selected_group": "同名群",
+                "output_path": str(root / "结果"),
+            }, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_group_settings(root)
+
+    def test_label_folder_names_reject_collisions(self):
+        self.assertEqual(gui._label_folder_names(["战狼"])["战狼"], "战狼")
+        with self.assertRaises(ValueError):
+            gui._label_folder_names(["A/B", "A:B"])
+
+    def test_read_report_keys_raises_instead_of_silently_returning_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "提取报告.csv"
+            path.write_text("备注,来源,消息ID,北京时间,本地文件\n战狼,@a,1,2026-10-05T12:00:00+08:00,C:/x.jpg\n",
+                            encoding="utf-8-sig")
+            self.assertEqual(len(gui.read_report_keys(path)), 1)
+            self.assertTrue(gui.report_header_is_current(path))
+            with patch.object(Path, "open", side_effect=PermissionError("locked")):
+                with self.assertRaises(OSError):
+                    gui.read_report_keys(path)
+
+    def test_report_header_detects_old_four_column_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "提取报告.csv"
+            path.write_text("备注,消息ID,北京时间,本地文件\n战狼,1,2026-10-05T12:00:00+08:00,C:/x.jpg\n",
+                            encoding="utf-8-sig")
+            self.assertFalse(gui.report_header_is_current(path))
+
+    def test_truncated_image_without_known_size_is_not_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "broken.jpg"
+            payload = self._png_bytes()
+            path.write_bytes(payload[:12])
+            message = SimpleNamespace(file=SimpleNamespace(size=None))
+            self.assertFalse(gui.downloaded_file_is_complete(path, message))
+            path.write_bytes(payload)
+            self.assertTrue(gui.downloaded_file_is_complete(path, message))
+
+
+    def test_read_report_rows_drops_header_and_keeps_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "提取报告.csv"
+            path.write_text(
+                "备注,来源,消息ID,北京时间,本地文件\n"
+                "战狼,@a,1,2026-10-05T12:00:00+08:00,C:/a.jpg\n"
+                "68,@b,2,2026-10-05T12:00:01+08:00,C:/b.jpg\n",
+                encoding="utf-8-sig",
+            )
+            rows = gui.read_report_rows(path)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][0], "战狼")
+            self.assertEqual(gui.read_report_rows(Path(directory) / "不存在.csv"), [])
+
+
+    def test_ocr_short_label_still_matches_next_to_a_longer_number(self):
+        class FakeOCR:
+            def __init__(self, *lines):
+                self.lines = list(lines)
+
+            def predict(self, image):
+                return [{"rec_texts": self.lines}]
+
+        payload = self._png_bytes()
+        # 只有“贴着的那一侧本身是数字/中文数字”才算粘连，正常牌面不能被判成不命中。
+        self.assertEqual(ocr_labels_from_payload(payload, {"五肖"}, FakeOCR("五肖六码")), {"五肖"})
+        self.assertEqual(ocr_labels_from_payload(payload, {"战狼"}, FakeOCR("战狼168")), {"战狼"})
+        self.assertEqual(ocr_labels_from_payload(payload, {"战狼"}, FakeOCR("168战狼")), {"战狼"})
+        self.assertEqual(ocr_labels_from_payload(payload, {"九肖"}, FakeOCR("九肖十码")), {"九肖"})
+
+    def test_auto_capture_marks_today_when_attempt_two_runs_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = {"groups": [{"name": "自动群", "address": "@a", "start_time": "00:00", "end_time": "23:59"}],
+                        "selected_group": "自动群", "output_path": str(root / "结果")}
+            profile = settings["groups"][0]
+            config = normalize_auto_capture_settings(dict(
+                enabled=True, first_time="18:00", second_time="22:30", min_images=1000,
+                first_attempt_date="2026-10-17",
+            ))
+            gui.save_auto_capture_settings(root, settings, profile, config)
+
+            app = SimpleNamespace(
+                program_root=root, settings=settings, log=lambda _text: None,
+                start_download=lambda **_kwargs: None,
+            )
+            app._auto_capture_context = None
+            TelegramDownloaderApp._begin_auto_capture(app, profile, config, 2, date(2026, 10, 18))
+
+            saved = load_group_settings(root)["groups"][0]["auto_capture"]
+            # 必须无条件写成今天，否则前一天残留的 first_attempt_date 会让每轮轮询反复触发。
+            self.assertEqual(saved["first_attempt_date"], "2026-10-18")
+            self.assertEqual(saved["second_attempt_date"], "2026-10-18")
+            late = datetime(2026, 10, 18, 23, 0, tzinfo=timezone(timedelta(hours=8)))
+            self.assertIsNone(auto_capture_due(saved, late))
+
+    def test_default_paths_fall_back_to_project_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "已清理的旧目录"
+            with patch.object(gui, "LEGACY_WORKSPACE", missing):
+                self.assertEqual(gui.default_output_path(), gui.project_root() / "结果")
+                self.assertEqual(gui.default_status_root(), gui.project_root() / "outputs" / "抓取状态")
+                # 不能出现 outputs\outputs 这种多一层的错误回退。
+                self.assertNotIn(gui.project_root(), gui.default_status_root().parents[1].parents)
+
+    def test_truncated_jpeg_without_known_size_is_not_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "broken.jpg"
+            payload = io.BytesIO()
+            Image.new("RGB", (400, 400), (200, 30, 30)).save(payload, format="JPEG")
+            data = payload.getvalue()
+            path.write_bytes(data)
+            message = SimpleNamespace(file=SimpleNamespace(size=None))
+            self.assertTrue(gui.downloaded_file_is_complete(path, message))
+            path.write_bytes(data[: int(len(data) * 0.6)])
+            self.assertFalse(gui.downloaded_file_is_complete(path, message))
+
+
+    def test_ocr_label_does_not_match_punctuation_joined_digits(self):
+        class FakeOCR:
+            def __init__(self, *lines):
+                self.lines = list(lines)
+
+            def predict(self, image):
+                return [{"rec_texts": self.lines}]
+
+        payload = self._png_bytes()
+        # 顿号/逗号/小数点隔开的数字不是 68，不能被拼成标签。
+        self.assertEqual(ocr_labels_from_payload(payload, {"68"}, FakeOCR("6、8码")), set())
+        self.assertEqual(ocr_labels_from_payload(payload, {"68"}, FakeOCR("6,8码")), set())
+        self.assertEqual(ocr_labels_from_payload(payload, {"68"}, FakeOCR("6.8码")), set())
+        # 原本就有空白的真命中要能救回
+        self.assertEqual(ocr_labels_from_payload(payload, {"68"}, FakeOCR("1 68码")), {"68"})
 
 
 if __name__ == "__main__":

@@ -42,11 +42,11 @@ APP_DATA = (
      else Path(__file__).resolve().parent).parent
     / "运行数据"
 )
+LEGACY_WORKSPACE = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图")
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.4.2"
+APP_VERSION = "v5.4.3"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
-DEFAULT_OUTPUT_PATH = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果")
 DOWNLOAD_CONCURRENCY = 14
 AUTO_CAPTURE_POLL_MS = 15000
 SPECIAL_RETRY_GROUP = "嫣然心水"
@@ -89,13 +89,19 @@ DARK_BOTTOM = "#121315"
 FORM_FONT = ("Microsoft YaHei UI", 13)
 RUNTIME_LOG_DIR_NAME = "运行日志"
 UI_SETTINGS_NAME = "ui_settings.json"
-WINDOW_PRESETS = {"2k": (1440, 860), "1080": (1440, 860)}
+WINDOW_PRESETS = {"2k": (1600, 960), "1080": (1440, 860)}
 WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))
 }
 UI_HEARTBEAT_SECONDS = 1.0
 UI_FREEZE_SECONDS = 5.0
 UI_FREEZE_DUMP_COOLDOWN = 30.0
+SECRET_PROMPT_TIMEOUT = 240.0
+DOWNLOAD_ATTEMPTS = 2
+FLOOD_WAIT_MAX_RETRY_SECONDS = 120
+TRANSIENT_DOWNLOAD_ERRORS = (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError)
+LOG_VIEW_MAX_BYTES = 256 * 1024
+LOGIN_WATCHDOG_MAX_CHECKS = 10
 
 
 def thread_stack_dump() -> str:
@@ -248,9 +254,7 @@ def save_saved_credentials(path: Path, api_id: int, api_hash: str, phone: str) -
     ).encode("utf-8")
     encrypted = _dpapi(plaintext, protect=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_bytes(encrypted)
-    os.replace(temporary, path)
+    _atomic_write_bytes(path, encrypted)
 
 
 def load_saved_credentials(path: Path) -> tuple[int, str, str] | None:
@@ -263,6 +267,43 @@ def load_saved_credentials(path: Path) -> tuple[int, str, str] | None:
     if not api_hash or not phone:
         raise ValueError("保存的登录配置不完整")
     return api_id, api_hash, phone
+
+
+def _temp_sibling(path: Path) -> Path:
+    """Per-process, per-call temporary name so two instances never share a .tmp file."""
+    path = Path(path)
+    return path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temp_sibling(path)
+    try:
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    _atomic_write_bytes(path, text.encode(encoding))
+
+
+def project_root() -> Path:
+    """工程根目录：frozen 时是 outputs 的上一级，开发时是 work 的上一级。"""
+    return runtime_root().parent
+
+
+def default_output_path() -> Path:
+    """Prefer the historical workspace directory, fall back to the project directory."""
+    return LEGACY_WORKSPACE / "结果" if LEGACY_WORKSPACE.is_dir() else project_root() / "结果"
+
+
+def default_status_root() -> Path:
+    if LEGACY_WORKSPACE.is_dir():
+        return LEGACY_WORKSPACE / "outputs" / "抓取状态"
+    return project_root() / "outputs" / "抓取状态"
 
 
 def normalized(text: str) -> str:
@@ -298,9 +339,7 @@ def session_blob_path(directory: Path) -> Path:
 def save_session_string(path: Path, value: str) -> None:
     encrypted = _dpapi(value.encode("utf-8"), protect=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_bytes(encrypted)
-    os.replace(temporary, path)
+    _atomic_write_bytes(path, encrypted)
 
 
 def load_session_string(path: Path) -> str | None:
@@ -375,9 +414,7 @@ def load_account_profiles(app_data: Path) -> list[dict]:
 def write_account_manifest(app_data: Path, profiles: list[dict]) -> None:
     path = Path(app_data) / "accounts.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps({"accounts": profiles}, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    _atomic_write_text(path, json.dumps({"accounts": profiles}, ensure_ascii=False, indent=2))
 
 
 def save_account_profile(app_data: Path, profile: dict) -> None:
@@ -458,9 +495,7 @@ def save_selected_account(app_data: Path, account_id: str) -> None:
         raise ValueError("不能保存不存在的账号")
     path = Path(app_data) / "account_selection.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps({"account_id": account_id}), encoding="utf-8")
-    os.replace(temporary, path)
+    _atomic_write_text(path, json.dumps({"account_id": account_id}))
 
 
 def load_window_preset(app_data: Path) -> str:
@@ -480,9 +515,7 @@ def save_window_preset(app_data: Path, preset: str) -> None:
         raise ValueError("窗口分辨率选项无效")
     path = Path(app_data) / UI_SETTINGS_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps({"window_preset": preset}, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    _atomic_write_text(path, json.dumps({"window_preset": preset}, ensure_ascii=False, indent=2))
 
 
 def create_account_profile(app_data: Path, name: str, api_id: int, api_hash: str, phone: str) -> dict:
@@ -491,7 +524,11 @@ def create_account_profile(app_data: Path, name: str, api_id: int, api_hash: str
         raise ValueError("账号名称须为 1～80 个字")
     phone = normalize_account_phone(phone)
     for profile in load_account_profiles(app_data):
-        saved = load_saved_credentials(account_directory(app_data, profile["id"]) / "credentials.bin")
+        try:
+            saved = load_saved_credentials(account_directory(app_data, profile["id"]) / "credentials.bin")
+        except (OSError, ValueError):
+            # One broken account must not block adding a new one.
+            continue
         if saved and normalize_account_phone(saved[2]) == phone:
             raise ValueError("这个手机号已保存，请从账号列表选择，不要重复添加")
     profile = {"id": uuid4().hex, "name": name, "user_id": None}
@@ -512,21 +549,21 @@ def delete_account_profile(app_data: Path, account_id: str) -> None:
         raise ValueError("账号保存路径无效")
     remaining = [item for item in profiles if item["id"] != account_id]
     path = root / "accounts.json"
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps({"accounts": remaining}, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        os.replace(temporary, path)
-    except OSError:
-        temporary.unlink(missing_ok=True)
-        raise
+    _atomic_write_text(path, json.dumps({"accounts": remaining}, ensure_ascii=False, indent=2))
     if directory.exists():
         shutil.rmtree(directory)
     selection = root / "account_selection.json"
     try:
-        if selection.exists() and json.loads(selection.read_text(encoding="utf-8-sig")).get("account_id") == account_id:
-            selection.unlink()
+        if not selection.exists():
+            return
+        payload = json.loads(selection.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        pass
+        return
+    if isinstance(payload, dict) and payload.get("account_id") == account_id:
+        try:
+            selection.unlink()
+        except OSError:
+            pass
 
 
 def verify_account_user(profile: dict, user, phone: str) -> None:
@@ -644,13 +681,7 @@ def _clean_keyword_entries(values) -> list[str]:
 
 def write_notes_config(path: Path, keywords) -> None:
     entries = _clean_keyword_entries(keywords)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps({"keywords": entries}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    _atomic_write_text(path, json.dumps({"keywords": entries}, ensure_ascii=False, indent=2))
 
 
 def migrate_group_notes_config(program_root: Path, group_name: str) -> Path:
@@ -669,7 +700,7 @@ def _default_group_settings() -> dict:
     return {
         "groups": [],
         "selected_group": "",
-        "output_path": str(DEFAULT_OUTPUT_PATH),
+        "output_path": str(default_output_path()),
     }
 
 
@@ -677,9 +708,7 @@ def _write_group_settings(program_root: Path, settings: dict) -> None:
     if settings.get("_load_error"):
         raise ValueError(settings["_load_error"])
     path = group_directory(program_root) / GROUP_SETTINGS_NAME
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    _atomic_write_text(path, json.dumps(settings, ensure_ascii=False, indent=2))
 
 
 def load_group_settings(program_root: Path, *, read_only: bool = False) -> dict:
@@ -695,6 +724,7 @@ def load_group_settings(program_root: Path, *, read_only: bool = False) -> dict:
         raise ValueError("群配置文件格式无效")
     settings = _default_group_settings()
     groups = []
+    seen_names: set[str] = set()
     for item in payload["groups"]:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("address"), str):
             raise ValueError("群配置文件包含无效项目")
@@ -708,6 +738,11 @@ def load_group_settings(program_root: Path, *, read_only: bool = False) -> dict:
             "start_time": start_time,
             "end_time": end_time,
         }
+        folded = group["name"].casefold()
+        if folded in seen_names:
+            # The group name is the Treeview item id, so duplicates would break the list.
+            raise ValueError(f"群配置文件存在重复群名：{group['name']}")
+        seen_names.add(folded)
         if "auto_capture" in item:
             try:
                 group["auto_capture"] = normalize_auto_capture_settings(item.get("auto_capture"))
@@ -774,16 +809,14 @@ def save_group_profile(
     current = next((item for item in groups if item["name"] == old_name), None) if old_name else None
     if old_name and current is None:
         raise ValueError("要修改的群配置不存在")
+    renamed_notes: tuple[Path, Path] | None = None
     if current:
         if old_name != new_name:
             old_path = group_notes_path(program_root, old_name)
             new_path = group_notes_path(program_root, new_name)
             if new_path.exists():
                 raise ValueError(f"备注文件已存在：{new_path.name}")
-            if old_path.exists():
-                os.replace(old_path, new_path)
-            else:
-                write_notes_config(new_path, [])
+            renamed_notes = (old_path, new_path)
         current.update(name=new_name, address=address, start_time=start_time, end_time=end_time)
         if chat_id is None:
             current.pop("chat_id", None)
@@ -797,12 +830,19 @@ def save_group_profile(
             group["chat_id"] = chat_id
             group["bound_account_id"] = bound_account_id
         groups.append(group)
-        notes_path = group_notes_path(program_root, new_name)
-        if not notes_path.exists():
-            write_notes_config(notes_path, [])
     if settings.get("selected_group") == old_name or not settings.get("selected_group"):
         settings["selected_group"] = new_name
     _write_group_settings(program_root, settings)
+    # Move the notes file only after the settings write succeeded: a failed write
+    # must not leave the old group name pointing at a renamed file.
+    if renamed_notes is not None:
+        old_path, new_path = renamed_notes
+        if old_path.exists():
+            os.replace(old_path, new_path)
+        elif not new_path.exists():
+            write_notes_config(new_path, [])
+    elif not group_notes_path(program_root, new_name).exists():
+        write_notes_config(group_notes_path(program_root, new_name), [])
 
 
 def delete_group_profile(program_root: Path, settings: dict, name: str) -> None:
@@ -818,6 +858,22 @@ def delete_group_profile(program_root: Path, settings: dict, name: str) -> None:
 def safe_folder_name(text: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text).strip(" .")
     return name[:100] or "未命名"
+
+
+def _label_folder_names(labels) -> dict[str, str]:
+    """Map each label to its folder name, refusing labels that collapse to the same name."""
+    names: dict[str, str] = {}
+    owners: dict[str, str] = {}
+    for label in dict.fromkeys(labels):
+        name = safe_folder_name(label)
+        previous = owners.get(name.casefold())
+        if previous is not None and previous != label:
+            raise ValueError(
+                f"备注「{previous}」与「{label}」会写入同一个文件夹「{name}」，请改名后再抓取"
+            )
+        owners[name.casefold()] = label
+        names[label] = name
+    return names
 
 
 def dated_group_output(output: Path, target_day: date, group_name: str) -> Path:
@@ -848,10 +904,7 @@ def load_capture_status(path: Path) -> dict | None:
 
 
 def save_capture_status(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def manual_capture_log_path(status_root: Path) -> Path:
@@ -863,10 +916,7 @@ def save_manual_capture_log(path: Path, days: dict[str, list[str]]) -> None:
         day: sorted(set(groups))
         for day, groups in sorted(days.items())
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps({"days": normalized}, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    _atomic_write_text(path, json.dumps({"days": normalized}, ensure_ascii=False, indent=2))
 
 
 def load_manual_capture_log(path: Path, today: date, *, log=None) -> dict[str, list[str]]:
@@ -978,6 +1028,23 @@ class CaptureResult(NamedTuple):
     failed_images: int = 0
 
 
+IMAGE_MAGIC_PREFIXES = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF8", b"BM", b"II*\x00", b"MM\x00*")
+
+
+def looks_like_image(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(16)
+    except OSError:
+        return False
+    if any(head.startswith(prefix) for prefix in IMAGE_MAGIC_PREFIXES):
+        return True
+    if head.startswith(b"RIFF"):
+        # RIFF also covers AVI/WAV; an 8-byte-only header is a truncated WebP and must be verified.
+        return len(head) < 12 or head[8:12] == b"WEBP"
+    return False
+
+
 def downloaded_file_is_complete(path: Path, message, *, previously_failed: bool = False) -> bool:
     if not path.is_file():
         return False
@@ -986,7 +1053,19 @@ def downloaded_file_is_complete(path: Path, message, *, previously_failed: bool 
     if isinstance(expected, int) and expected > 0:
         return size == expected
     # Old failed downloads without a known size cannot be trusted merely because they exist.
-    return size > 0 and not previously_failed
+    if size <= 0 or previously_failed:
+        return False
+    # No expected size: a truncated file still "exists", so an image-shaped file must fully decode.
+    if looks_like_image(path):
+        try:
+            with Image.open(path) as image:
+                image.verify()
+            with Image.open(path) as image:
+                # verify() lets a truncated JPEG pass, so decode it fully as well.
+                image.load()
+        except (OSError, UnidentifiedImageError, ValueError):
+            return False
+    return True
 
 
 def report_row_key(row) -> tuple[str, str, str, str]:
@@ -997,21 +1076,36 @@ def report_row_key(row) -> tuple[str, str, str, str]:
     return (cells[0], "", cells[1], cells[3])
 
 
-def read_report_keys(path: Path) -> set[tuple[str, str, str, str]]:
-    """读取现有报告的行键（同时兼容 4 列旧格式与 5 列新格式）；读取失败视为无已有行。"""
-    keys: set[tuple[str, str, str, str]] = set()
+def read_report_rows(path: Path) -> list[list[str]]:
+    """报告的已有数据行；读取失败必须抛出，不能当作“没有旧行”。
+
+    兼容旧格式：文件没有表头时不当表头吃掉第一行；4 列旧行统一补一个空“来源”列。
+    """
     if not path.is_file():
-        return keys
-    try:
-        with path.open("r", newline="", encoding="utf-8-sig") as handle:
-            reader = csv.reader(handle)
-            next(reader, None)
-            for row in reader:
-                if len(row) >= 4:
-                    keys.add(report_row_key(row))
-    except OSError:
-        return set()
-    return keys
+        return []
+    with path.open("r", newline="", encoding="utf-8-sig") as handle:
+        rows = [row for row in csv.reader(handle) if row]
+    if rows and rows[0] and rows[0][0].strip() == REPORT_HEADER[0]:
+        # 当前 5 列表头和旧 4 列表头的首列都是「备注」；没有表头的文件不会走到这里。
+        rows = rows[1:]
+    for row in rows:
+        if len(row) == 4:
+            row.insert(1, "")
+    return rows
+
+
+def read_report_keys(path: Path) -> set[tuple[str, str, str, str]]:
+    """读取现有报告的行键（同时兼容 4 列旧格式与 5 列新格式）。"""
+    return {report_row_key(row) for row in read_report_rows(path) if len(row) >= 4}
+
+
+def report_header_is_current(path: Path) -> bool:
+    """Return True when an existing report already uses the current 5-column header."""
+    if not path.is_file() or path.stat().st_size == 0:
+        return True
+    with path.open("r", newline="", encoding="utf-8-sig") as handle:
+        header = next(csv.reader(handle), [])
+    return header == REPORT_HEADER
 
 
 def _notes_from_entries(entries) -> dict[str, str]:
@@ -1066,6 +1160,8 @@ def parse_day(value: str) -> date:
 
 
 def parse_clock(value: str) -> clock_time:
+    if not isinstance(value, str):
+        raise ValueError("时间格式应为 HH:MM，例如 14:30")
     try:
         return datetime.strptime(value.strip(), "%H:%M").time()
     except ValueError as exc:
@@ -1167,7 +1263,8 @@ def auto_capture_due(config: dict, now: datetime) -> int | None:
     if config["captured_date"] == day or config["threshold_met_date"] == day:
         return None
     if config["first_attempt_date"] != day and now.time() >= parse_clock(config["first_time"]):
-        return 1
+        # Starting after the second time must not trigger two back-to-back full scans.
+        return 2 if now.time() >= parse_clock(config["second_time"]) else 1
     if (
         config["first_attempt_date"] == day
         and config["second_attempt_date"] != day
@@ -1371,50 +1468,55 @@ def ocr_model_root() -> Path:
     return base.parent / "models"
 _OCR_ENGINE = None
 _OCR_ENGINE_ERROR: Exception | None = None
+_OCR_ENGINE_LOCK = threading.Lock()
 
 
 def get_ocr_engine():
     global _OCR_ENGINE, _OCR_ENGINE_ERROR
     if _OCR_ENGINE is not None:
         return _OCR_ENGINE
-    if _OCR_ENGINE_ERROR is not None:
-        raise OcrError(
-            "GPU OCR 不可用，CPU 识别已禁用。请修复环境后重启软件。"
-            "原因：" + ocr_engine_error_text()
-        ) from _OCR_ENGINE_ERROR
-    try:
-        import paddle
+    # Two concurrent first calls would each build a PaddleOCR and double the VRAM.
+    with _OCR_ENGINE_LOCK:
+        if _OCR_ENGINE is not None:
+            return _OCR_ENGINE
+        if _OCR_ENGINE_ERROR is not None:
+            raise OcrError(
+                "GPU OCR 不可用，CPU 识别已禁用。请修复环境后重启软件。"
+                "原因：" + ocr_engine_error_text()
+            ) from _OCR_ENGINE_ERROR
+        try:
+            import paddle
 
-        if not paddle.is_compiled_with_cuda():
-            raise RuntimeError("当前 Paddle 不支持 CUDA，请安装 paddlepaddle-gpu")
-        if paddle.device.cuda.device_count() < 1:
-            raise RuntimeError("未检测到可用的 CUDA GPU，请检查显卡和驱动")
-        paddle.set_device(OCR_DEVICE)
-        if str(paddle.device.get_device()).lower() != OCR_DEVICE:
-            raise RuntimeError(f"Paddle 未切换到 {OCR_DEVICE}，实际设备为 {paddle.device.get_device()}")
+            if not paddle.is_compiled_with_cuda():
+                raise RuntimeError("当前 Paddle 不支持 CUDA，请安装 paddlepaddle-gpu")
+            if paddle.device.cuda.device_count() < 1:
+                raise RuntimeError("未检测到可用的 CUDA GPU，请检查显卡和驱动")
+            paddle.set_device(OCR_DEVICE)
+            if str(paddle.device.get_device()).lower() != OCR_DEVICE:
+                raise RuntimeError(f"Paddle 未切换到 {OCR_DEVICE}，实际设备为 {paddle.device.get_device()}")
 
-        from paddleocr import PaddleOCR
+            from paddleocr import PaddleOCR
 
-        engine = PaddleOCR(
-            text_detection_model_name=OCR_MODEL_DET,
-            text_recognition_model_name=OCR_MODEL_REC,
-            device=OCR_DEVICE,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            enable_hpi=False,
-            use_tensorrt=False,
-            precision="fp32",
-            enable_mkldnn=False,
-        )
-    except Exception as exc:  # pragma: no cover - depends on optional GPU runtime/model files
-        _OCR_ENGINE_ERROR = exc
-        raise OcrError(
-            "GPU OCR 初始化失败，CPU 识别已禁用。请修复环境后重启软件。"
-            "原因：" + ocr_engine_error_text()
-        ) from exc
-    _OCR_ENGINE = engine
-    return _OCR_ENGINE
+            engine = PaddleOCR(
+                text_detection_model_name=OCR_MODEL_DET,
+                text_recognition_model_name=OCR_MODEL_REC,
+                device=OCR_DEVICE,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                enable_hpi=False,
+                use_tensorrt=False,
+                precision="fp32",
+                enable_mkldnn=False,
+            )
+        except Exception as exc:  # pragma: no cover - depends on optional GPU runtime/model files
+            _OCR_ENGINE_ERROR = exc
+            raise OcrError(
+                "GPU OCR 初始化失败，CPU 识别已禁用。请修复环境后重启软件。"
+                "原因：" + ocr_engine_error_text()
+            ) from exc
+        _OCR_ENGINE = engine
+        return _OCR_ENGINE
 
 
 def ocr_engine_error_text() -> str:
@@ -1431,6 +1533,42 @@ def ocr_engine_error_text() -> str:
 
 def compact_text(text: str) -> str:
     return "".join(char for char in normalized(text).casefold() if char.isalnum() or "\u4e00" <= char <= "\u9fff")
+
+
+NUMERIC_RUN_CHARS = set("0123456789零〇○一二三四五六七八九十百千万亿萬億两兩廿卅壹贰叁肆伍陆柒捌玖拾佰仟")
+
+
+def _unglued_occurrence(text: str, needle: str) -> bool:
+    if not needle:
+        return False
+    left_numeric = needle[0] in NUMERIC_RUN_CHARS
+    right_numeric = needle[-1] in NUMERIC_RUN_CHARS
+    start = text.find(needle)
+    while start >= 0:
+        end = start + len(needle)
+        glued = (
+            (left_numeric and start > 0 and text[start - 1] in NUMERIC_RUN_CHARS)
+            or (right_numeric and end < len(text) and text[end] in NUMERIC_RUN_CHARS)
+        )
+        if not glued:
+            return True
+        start = text.find(needle, start + 1)
+    return False
+
+
+def _label_occurs(line: str, needle: str, spaced_line: str | None = None) -> bool:
+    """Locate a label without letting it match inside a longer number run.
+
+    A label must not be read out of 十五肖 / 168, so the edge that is itself a digit or Chinese
+    numeral is boundary-checked. ``spaced_line`` keeps the caller's word gaps: cleaning "1 68码"
+    into "168码" would otherwise reject a real 68. It is only consulted when the cleaned text
+    really contains the label, so punctuation-joined digits (6、8码) never become 68.
+    """
+    if _unglued_occurrence(line, needle):
+        return True
+    if not spaced_line or not needle or needle not in line:
+        return False
+    return _unglued_occurrence(spaced_line, needle)
 
 
 def ocr_labels_from_payload(payload: bytes, labels: set[str], ocr_engine=None, on_error=None, cleanup=None) -> set[str]:
@@ -1474,7 +1612,10 @@ def ocr_labels_from_payload(payload: bytes, labels: set[str], ocr_engine=None, o
             f"原因：{type(exc).__name__}: {exc}"
         ) from exc
     clean = cleanup or (lambda text: "".join(normalized(text).casefold().split()))
-    haystack = clean("".join(recognized))
+    # Match line by line: joining every line would let two unrelated lines spell a label.
+    lines = [clean(text) for text in recognized]
+    # 用同一个 cleanup 逐段清理再拼回，只保留原有的词间空隙，供边界判定复核。
+    spaced_lines = [" ".join(clean(part) for part in text.split()) for text in recognized]
     variants = {
         "战狼": ("战狼", "戰狼"),
         "红人馆": ("红人馆", "紅人館"),
@@ -1486,7 +1627,11 @@ def ocr_labels_from_payload(payload: bytes, labels: set[str], ocr_engine=None, o
     matched = set()
     for label in labels:
         candidates = variants.get(label, (label,))
-        if any(clean(candidate) in haystack for candidate in candidates):
+        if any(
+            _label_occurs(line, clean(candidate), spaced)
+            for candidate in candidates
+            for line, spaced in zip(lines, spaced_lines)
+        ):
             matched.add(label)
     return matched
 
@@ -1598,7 +1743,8 @@ def add_first_image_ocr_immediate_groups(
             if ocr_cache is not None:
                 ocr_cache[cache_key] = hits
         candidate = candidate_groups[first_id]
-        labels_to_add = hits if detected_labels is not None else requested_labels.intersection(hits)
+        # Copy the cached hit set: the similarity fallback below mutates labels_to_add.
+        labels_to_add = set(hits) if detected_labels is not None else requested_labels.intersection(hits)
         if detected_labels is not None:
             if log:
                 log(
@@ -1715,10 +1861,24 @@ def image_color_signature(payload: bytes) -> tuple[tuple[float, ...], float] | N
 def image_groups_are_similar(
     anchor_payloads: list[bytes], candidate_payloads: list[bytes],
     *, min_intersection: float = 0.60, max_aspect_ratio: float = 1.35,
+    log=None,
 ) -> bool:
-    anchors = [signature for payload in anchor_payloads if (signature := image_color_signature(payload))]
-    candidates = [signature for payload in candidate_payloads if (signature := image_color_signature(payload))]
+    def signatures(payloads, side: str) -> list:
+        result = []
+        for payload in payloads:
+            signature = image_color_signature(payload)
+            if signature is None:
+                if log:
+                    log(f"【识别】相似度：{side}图片无法解码，无法比对该张")
+            else:
+                result.append(signature)
+        return result
+
+    anchors = signatures(anchor_payloads, "基准组")
+    candidates = signatures(candidate_payloads, "相邻组")
     if not anchors or not candidates:
+        if log:
+            log("【识别】相似度：可用图片不足，本次按“不是同一类”处理")
         return False
 
     def similar(candidate) -> bool:
@@ -1791,7 +1951,7 @@ class TelegramDownloaderApp:
         self.root = root
         self.app_data = app_data
         self.program_root = Path(program_root) if program_root else runtime_root()
-        self.status_root = Path(status_root) if status_root else STATUS_OUTPUT_DIR
+        self.status_root = Path(status_root) if status_root else default_status_root()
         self._workflow_log_path = Path(workflow_log).expanduser() if workflow_log else None
         notes_errors = []
         try:
@@ -1829,12 +1989,15 @@ class TelegramDownloaderApp:
         self._log_lock = threading.RLock()
         self._log_day: date | None = None
         self._log_group = "系统"
+        self._log_group_written = ""
         self._log_rollover_id = None
         self._ui_queue: queue.Queue = queue.Queue()
         self._ui_pump_id = None
         self._login_token = ""
+        self._login_in_progress = False
         self._ui_heartbeat = time.monotonic()
         self._watchdog_stop = threading.Event()
+        self._cancel_event = threading.Event()
 
         self.style = ttk.Style(root)
         self.style.theme_use("clam")
@@ -2401,6 +2564,9 @@ class TelegramDownloaderApp:
                 captured_date="",
             )
         else:
+            # Starting after the second time skips attempt 1: mark BOTH dates for today, otherwise a
+            # leftover first_attempt_date from an earlier day would keep re-triggering every poll.
+            config["first_attempt_date"] = day
             config["second_attempt_date"] = day
         try:
             save_auto_capture_settings(self.program_root, self.settings, profile, config)
@@ -2603,6 +2769,18 @@ class TelegramDownloaderApp:
         if self.logged_in and self.active_account_id == profile["id"]:
             messagebox.showwarning("无法删除", "该账号正在登录使用中，请先退出登录后再删除。", parent=self.login_settings_window)
             return
+        bound_groups = [
+            item["name"] for item in self.settings.get("groups", [])
+            if item.get("bound_account_id") == profile["id"]
+        ]
+        if bound_groups:
+            # 删掉被私密群绑定的账号，只会让该群在抓取时报一个不指向根因的错。
+            messagebox.showwarning(
+                "无法删除",
+                "以下私密群仍绑定该账号，请先在群组设置里改绑其他账号：\n\n" + "、".join(bound_groups),
+                parent=self.login_settings_window,
+            )
+            return
         if not messagebox.askyesno(
             "删除账号",
             f"确定删除账号“{profile['name']}”吗？\n\n将同时删除该账号的登录凭据和会话文件，删除后无法恢复，需要重新添加并登录。",
@@ -2774,7 +2952,7 @@ class TelegramDownloaderApp:
             _write_group_settings(self.program_root, self.settings)
 
     def open_output(self) -> None:
-        path = Path(self.output_path.get()).expanduser()
+        path = Path(self.output_path.get().strip().strip('"')).expanduser()
         try:
             group = self.selected_group_profile(required=False)
             target_day = parse_day(self.day.get())
@@ -2851,10 +3029,31 @@ class TelegramDownloaderApp:
         if path == Path(path.anchor) or any(path == item or path in item.parents for item in protected):
             messagebox.showwarning("无法清除", "为避免误删，不能清除磁盘根目录、用户目录或软件目录")
             return
-        path.mkdir(parents=True, exist_ok=True)
+        # Narrow the deletion to the selected group and day whenever both are known.
+        group = self.selected_group_profile(required=False)
+        if group:
+            try:
+                target_day = parse_day(self.day.get())
+            except ValueError:
+                # 日期非法时绝不能回退成清除整个结果根目录。
+                messagebox.showwarning("日期错误", "日期格式应为 YYYY-MM-DD，已取消清除")
+                return
+            scope = dated_group_output(path, target_day, group["name"])
+            scope_label = f"{group['name']} · {target_day.isoformat()}"
+        else:
+            scope = path
+            scope_label = "未选择群：全部群、全部日期"
+        if not scope.is_dir():
+            messagebox.showinfo("没有可清除的结果", f"该范围还没有结果目录：\n{scope}")
+            return
+        if not messagebox.askyesno(
+            "清除结果",
+            f"确定清除以下结果吗？\n\n{scope_label}\n{scope}\n\n删除后无法恢复。",
+        ):
+            return
         removed = 0
         try:
-            for item in path.iterdir():
+            for item in scope.iterdir():
                 if item.is_symlink() or item.is_file():
                     item.unlink()
                 else:
@@ -2866,7 +3065,7 @@ class TelegramDownloaderApp:
             return
         self.task_status.set(f"已清除结果：{removed} 项")
         self.update_first_capture_status()
-        self.log(f"已清空结果目录：{path}（{removed} 项）")
+        self.log(f"已清空结果目录：{scope}（{removed} 项）")
 
     def retry_unmatched(self) -> None:
         if self.chat.get() != SPECIAL_RETRY_GROUP:
@@ -2941,12 +3140,18 @@ class TelegramDownloaderApp:
         with self._log_lock:
             path = clear_old_runtime_logs(self.log_root, today, self._log_group)
             self._log_day = today
+            self._log_group_written = self._log_group
         return path
 
     def _load_runtime_log(self) -> None:
         path = self._rotate_runtime_log()
         try:
-            content = path.read_text(encoding="utf-8")
+            # Only the tail: a day with freeze dumps can reach megabytes and freeze startup.
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - LOG_VIEW_MAX_BYTES))
+                content = handle.read().decode("utf-8", "replace")
         except OSError:
             content = ""
         if content:
@@ -2976,7 +3181,12 @@ class TelegramDownloaderApp:
         with self._log_lock:
             try:
                 now = datetime.now(CN_TZ)
-                path = self._rotate_runtime_log(now.date())
+                if self._log_day == now.date() and self._log_group_written == self._log_group:
+                    # Same day and group as the last rotation: skip the directory rescan.
+                    path = runtime_log_path(self.log_root, now.date(), self._log_group)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    path = self._rotate_runtime_log(now.date())
                 stamp = now.strftime("[%H:%M:%S] ")
                 with path.open("a", encoding="utf-8") as handle:
                     handle.write(stamp + text + "\n")
@@ -3031,6 +3241,8 @@ class TelegramDownloaderApp:
     def _on_capture_window_destroyed(self, event) -> None:
         if event.widget is self.root:
             self._watchdog_stop.set()
+            # Stop the download worker from starting new files before the process exits.
+            self._cancel_event.set()
             self._stop_capture_progress()
             if self._auto_capture_timer is not None:
                 try:
@@ -3098,8 +3310,15 @@ class TelegramDownloaderApp:
                 callback = self._ui_queue.get_nowait()
                 try:
                     callback()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Swallowing this would hide a failed task from both UI and log.
+                    try:
+                        self._append_log_file(
+                            f"【错误】界面回调异常：{type(exc).__name__}: {exc}\n"
+                            + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                        )
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
         try:
@@ -3204,40 +3423,123 @@ class TelegramDownloaderApp:
 
         self._post_to_main(update)
 
-    def run_worker(self, operation, on_success, on_failure=None) -> None:
+    def run_worker(self, operation, on_success, on_failure=None) -> bool:
+        """Start the worker thread; returns False when a task is already running."""
         if self._busy:
-            return
+            return False
         self.set_busy(True, "准备中…")
 
         def worker() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            reported = False
             try:
-                result = operation()
-            except Exception as exc:
-                error_text = str(exc) or "未知错误"
-                self.log(f"【错误】任务中止：{type(exc).__name__}: {exc}")
-                def fail(text=error_text) -> None:
-                    self.set_busy(False, "操作失败")
-                    if not self._workflow_mode and self._auto_capture_context is None:
-                        messagebox.showerror("操作失败", text)
-                    if on_failure is not None:
-                        on_failure(text) if self._workflow_mode else on_failure()
-                    elif self._workflow_mode:
-                        self._workflow_fail(text)
-                self._post_to_main(fail)
-                return
-            finally:
-                loop.close()
-                asyncio.set_event_loop(None)
-            def finish() -> None:
                 try:
-                    on_success(result)
+                    result = operation()
+                except Exception as exc:
+                    error_text = str(exc) or "未知错误"
+                    self.log(f"【错误】任务中止：{type(exc).__name__}: {exc}")
+                    def fail(text=error_text) -> None:
+                        self.set_busy(False, "操作失败")
+                        if not self._workflow_mode and self._auto_capture_context is None:
+                            messagebox.showerror("操作失败", text)
+                        if on_failure is not None:
+                            on_failure(text) if self._workflow_mode else on_failure()
+                        elif self._workflow_mode:
+                            self._workflow_fail(text)
+                    self._post_to_main(fail)
+                    reported = True
+                    return
                 finally:
-                    self.set_busy(False)
-            self._post_to_main(finish)
+                    loop.close()
+                    asyncio.set_event_loop(None)
+                def finish() -> None:
+                    try:
+                        on_success(result)
+                    finally:
+                        self.set_busy(False)
+                self._post_to_main(finish)
+                reported = True
+            except BaseException:
+                # A BaseException (e.g. CancelledError) never reaches the handlers above;
+                # the bail-out below still has to release the UI.
+                pass
+            finally:
+                if not reported:
+                    # Anything that escaped the handlers above must still release the UI,
+                    # otherwise the window stays busy forever.
+                    def bail() -> None:
+                        self.set_busy(False, "操作失败")
+                        if on_failure is not None:
+                            on_failure("任务异常终止") if self._workflow_mode else on_failure()
+                        elif self._workflow_mode:
+                            self._workflow_fail("任务异常终止")
+                    try:
+                        self.log("【错误】任务线程异常退出，已恢复界面")
+                        self._post_to_main(bail)
+                    except Exception:
+                        pass
 
         threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _write_extract_report(
+        self,
+        report: Path,
+        group_output: Path,
+        rows: list,
+        legacy_migration: bool,
+        append_requested: bool,
+        migrated_paths: dict,
+    ) -> None:
+        """把本次下载行合并进 提取报告.csv（整表重写，原子替换）。"""
+        append_report = append_requested and not legacy_migration and report.is_file() and report.stat().st_size > 0
+        existing_rows: list[list[str]] = []
+        header_upgrade = False
+        if append_report:
+            header_upgrade = not report_header_is_current(report)
+            existing_rows = read_report_rows(report)
+
+        if migrated_paths and existing_rows:
+            # 旧文件名已改名：已有行的旧路径要跟着改，否则同一张图两行、其中一行是死路径。
+            for existing in existing_rows:
+                renamed = migrated_paths.get((Path(existing[-1]).parent.name, Path(existing[-1]).name))
+                if renamed is not None:
+                    existing[-1] = renamed
+
+        new_rows = [list(row) for row in rows]
+        # 补列的旧行来源为空：同一张图本次已用带来源的新行记录时，丢掉那条空来源旧行，避免重复。
+        new_identities = {(row[0], str(row[2]), row[4]) for row in new_rows if len(row) >= 5}
+        if new_identities:
+            existing_rows = [
+                row for row in existing_rows
+                if not (len(row) >= 5 and row[1] == "" and (row[0], str(row[2]), row[4]) in new_identities)
+            ]
+
+        existing_report_keys = {report_row_key(row) for row in existing_rows if len(row) >= 4}
+        appended = []
+        for row in new_rows:
+            row_key = report_row_key(row)
+            if row_key in existing_report_keys:
+                continue
+            existing_report_keys.add(row_key)
+            appended.append(row)
+        if append_report and not appended and not header_upgrade:
+            self.log(f"【状态】提取报告无新增行：{report}")
+            return
+        if header_upgrade:
+            # 备份用"复制"而不是搬家：写新报告若失败，原报告必须还在，不能只剩备份。
+            backup = group_output / f"提取报告-旧格式备份-{datetime.now(CN_TZ).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:6]}.csv"
+            _atomic_write_bytes(backup, report.read_bytes())
+            self.log(f"【状态】旧格式报告已备份为 {backup.name}，本次按 5 列格式补齐来源列")
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(REPORT_HEADER)
+        writer.writerows(existing_rows)
+        writer.writerows(appended)
+        _atomic_write_bytes(report, b"\xef\xbb\xbf" + buffer.getvalue().encode("utf-8"))
+        self.log(f"【状态】提取报告已{'追加' if append_report else '保存'}：{report}"
+                 + (f"；新增 {len(appended)} 行" if append_report else ""))
 
     def credentials(self) -> tuple[int, str, str]:
         api_id = self.api_id.get().strip()
@@ -3249,14 +3551,26 @@ class TelegramDownloaderApp:
 
     def ask_secret(self, title: str, prompt: str, masked: bool = False) -> str:
         event = threading.Event()
+        abandoned = threading.Event()
         answer: dict[str, str | None] = {"value": None}
 
         def show_dialog() -> None:
-            answer["value"] = simpledialog.askstring(title, prompt, parent=self.root, show="●" if masked else None)
-            event.set()
+            if abandoned.is_set():
+                # 已经超时放弃：不要再弹一个没人等的对话框。
+                event.set()
+                return
+            try:
+                answer["value"] = simpledialog.askstring(title, prompt, parent=self.root, show="●" if masked else None)
+            except (TclError, RuntimeError):
+                answer["value"] = None
+            finally:
+                event.set()
 
         self._post_to_main(show_dialog)
-        event.wait()
+        # 每次弹窗各自给一段预算：两步验证的密码框不该因为验证码等久了就立刻超时。
+        if not event.wait(SECRET_PROMPT_TIMEOUT):
+            abandoned.set()
+            raise RuntimeError("等待验证码输入超时，登录已中止")
         value = answer["value"]
         if not value:
             raise RuntimeError("登录已取消")
@@ -3264,6 +3578,11 @@ class TelegramDownloaderApp:
 
     def login(self, *, automatic: bool = False, on_failure=None) -> None:
         if self._busy:
+            return
+        if self._login_in_progress:
+            # A previous login worker is still alive; a second one would share the same session file.
+            self.log("【账号】上一次登录尚未结束，已忽略本次登录请求")
+            self.task_status.set("登录进行中：请等待完成或关闭软件后重试")
             return
         if self._account_load_error:
             if self._workflow_mode:
@@ -3286,7 +3605,10 @@ class TelegramDownloaderApp:
                 saved = self.selected_credentials()
                 if normalize_account_phone(saved[2]) != phone:
                     raise ValueError("已有账号不能更换手机号，请使用添加账号")
-                profile = dict(next(item for item in self.account_profiles if item["id"] == self.selected_account_id))
+                current = next((item for item in self.account_profiles if item["id"] == self.selected_account_id), None)
+                if current is None:
+                    raise ValueError("所选账号已不存在，请重新选择或添加账号")
+                profile = dict(current)
             profile["name"] = name
             directory = account_directory(self.app_data, profile["id"])
             if automatic:
@@ -3370,15 +3692,51 @@ class TelegramDownloaderApp:
         token = self._login_token
         self.root.after(60000, lambda: self._login_watchdog(token))
         failure_callback = on_failure or (self._workflow_fail if self._workflow_mode else self.open_login_settings)
-        self.run_worker(operation, success, on_failure=failure_callback)
 
-    def _login_watchdog(self, token: str) -> None:
-        if token != self._login_token:
+        def finish_login(*_args) -> None:
+            # Clear the token too: a leftover token would let a later, unrelated busy task be
+            # force-unlocked 60 seconds later by this watchdog.
+            self._login_in_progress = False
+            self._login_token = ""
+
+        def login_success(result) -> None:
+            finish_login()
+            success(result)
+
+        def login_failure(*args) -> None:
+            finish_login()
+            failure_callback(*args)
+
+        self._login_in_progress = True
+        try:
+            started = self.run_worker(operation, login_success, on_failure=login_failure)
+        except BaseException:
+            # run_worker failed before it could report back; never leave the flag stuck.
+            self._login_in_progress = False
+            raise
+        if not started:
+            self._login_in_progress = False
+            self.log("【账号】已有任务在运行，本次登录未启动")
+
+    def _login_watchdog(self, token: str, attempt: int = 1) -> None:
+        if token != self._login_token or not self._login_in_progress:
+            # 登录已结束（成功/失败都会清 token），不再干涉后来的其它任务。
+            return
+        if not self._busy:
+            self._login_token = ""
+            return
+        if attempt < LOGIN_WATCHDOG_MAX_CHECKS:
+            # The worker may still be waiting for the SMS code; unlocking the UI here would let a
+            # second login run against the same session file. Re-arm instead of unlocking.
+            self.log(f"【账号】登录已等待约 {attempt} 分钟，仍在等待验证码或网络返回")
+            self.task_status.set("登录等待中：请完成验证码输入；如长时间无响应请关闭软件后重试")
+            self.root.after(60000, lambda: self._login_watchdog(token, attempt + 1))
             return
         self._login_token = ""
-        if not self._busy:
-            return
-        self.log("【账号】登录超时未返回（网络异常），已恢复界面；请重试")
+        # Give the flag up as well: keeping it set would reject every later login attempt
+        # even though the UI is unlocked again.
+        self._login_in_progress = False
+        self.log("【账号】登录长时间无响应，已强制恢复界面并放弃本次登录；如仍无法登录请关闭软件后重试")
         self.set_busy(False, "登录超时：网络异常，请重试")
         if self._workflow_mode:
             self._workflow_fail("登录超时：网络异常")
@@ -3490,8 +3848,11 @@ class TelegramDownloaderApp:
 
         def operation() -> CaptureResult:
             operation_started = time.monotonic()
+            self._cancel_event.clear()
             group_output = dated_group_output(output, target_day, group_name)
             status_enabled = notes_override is None
+            # 指定备注（嫣然“复抓未匹配”）只补这些备注的图，绝不能清掉当天其它备注的结果。
+            subset_capture = notes_override is not None
             status_path = capture_status_path(self.status_root, group_name) if status_enabled else None
             try:
                 previous_status = load_capture_status(status_path) if status_path else None
@@ -3535,6 +3896,8 @@ class TelegramDownloaderApp:
                 label for notes_map in base_notes_by_source.values()
                 for label in (notes_map.values() if notes_map else ["全部图片"])
             })
+            # 先校验备注名（归一后重名会写进同一目录），必须在删除当天结果目录之前报错。
+            label_folder_names = _label_folder_names(all_labels)
             pending_labels = {
                 label for notes_map in source_scan_notes.values() for label in notes_map.values()
             }
@@ -3612,6 +3975,19 @@ class TelegramDownloaderApp:
                                 raise ValueError("无法唯一找到该群，请改用 @用户名或 t.me 链接")
                             entity = matches[0]
                         entities.append((chat_address, entity))
+
+                seen_entities: dict[str, str] = {}
+                for chat_address, entity in entities:
+                    identity = str(getattr(entity, "id", "") or "")
+                    if not identity:
+                        continue
+                    previous = seen_entities.get(identity)
+                    if previous is not None:
+                        # 同一条消息被两个地址抓到会被下载两次、报告两行、计数翻倍。
+                        raise ValueError(
+                            f"群地址「{previous}」与「{chat_address}」指向同一个群，请只保留其中一个"
+                        )
+                    seen_entities[identity] = chat_address
 
                 self.log(
                     f"【扫描】正在{'增量' if incremental else '全量'}扫描 {len(entities)} 个群（逐个扫描） {target_day} "
@@ -3887,6 +4263,7 @@ class TelegramDownloaderApp:
                                 [preview_cache[message.id] for message in candidate],
                                 min_intersection=TIANJI_MIN_COLOR_INTERSECTION,
                                 max_aspect_ratio=TIANJI_MAX_ASPECT_RATIO,
+                                log=self.log,
                             )
 
                         def adjacent_similarity(anchor, candidate) -> bool:
@@ -3894,6 +4271,7 @@ class TelegramDownloaderApp:
                             return image_groups_are_similar(
                                 [preview_cache[message.id] for message in anchor],
                                 [preview_cache[message.id] for message in candidate],
+                                log=self.log,
                             )
 
                         if visual_adjacent_labels or first_image_ocr_labels:
@@ -3988,7 +4366,7 @@ class TelegramDownloaderApp:
                     f"扫描完成：共发现 {len(media_messages)} 张图片，符合条件 {matched_total} 张",
                 )
                 self.log(f"【扫描】扫描完成：共发现 {len(media_messages)} 张图片，符合条件 {matched_total} 张。")
-                if not incremental and group_output.exists():
+                if not incremental and not subset_capture and group_output.exists():
                     self.log(f"【状态】全量抓取覆盖本日期结果目录：{group_output}")
                     shutil.rmtree(group_output)
                 group_output.mkdir(parents=True, exist_ok=True)
@@ -4025,6 +4403,10 @@ class TelegramDownloaderApp:
                 rows = []
                 file_outcomes: Counter[str] = Counter()
                 download_started = time.monotonic()
+                pending_id_sets = {
+                    address: set(ids) for address, ids in source_pending_ids.items()
+                }
+                migrated_paths: dict[str, str] = {}
                 self.log(f"【下载】开始：{matched_total} 张待处理，并发 {DOWNLOAD_CONCURRENCY}；结果目录 {group_output}")
                 self.set_progress(0, matched_total, f"正在处理：0 / {matched_total}", phase_started=download_started)
 
@@ -4036,6 +4418,9 @@ class TelegramDownloaderApp:
                     ) -> None:
                         nonlocal processed
                         key = (address, message.id)
+                        if self._cancel_event.is_set():
+                            # 关窗口后不再发起新下载：进程随即退出，本次进度作废，不做任何成功计数。
+                            return
                         async with semaphore:
                             ext = message.file.ext if message.file else ".jpg"
                             if not ext or not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", ext):
@@ -4043,10 +4428,17 @@ class TelegramDownloaderApp:
                             stamp = message.date.astimezone(CN_TZ).strftime("%Y%m%d_%H%M%S")
                             filename = f"{stamp}_{source_tag(address)}_{message.id}{ext.lower()}"
                             for label in sorted(labels):
-                                folder = group_output / safe_folder_name(label)
-                                folder.mkdir(parents=True, exist_ok=True)
+                                folder = group_output / label_folder_names.get(label, safe_folder_name(label))
+                                try:
+                                    folder.mkdir(parents=True, exist_ok=True)
+                                except OSError as exc:
+                                    # 单张图建目录失败只记这一张失败，不能让整轮 gather 中断。
+                                    failed_label_ids[label].add(key)
+                                    file_outcomes["失败"] += 1
+                                    self.log(f"【下载】结果目录创建失败：{folder}（{type(exc).__name__}: {exc}）")
+                                    continue
                                 destination = folder / filename
-                                previously_failed = message.id in source_pending_ids.get(address, [])
+                                previously_failed = message.id in pending_id_sets.get(address, set())
                                 success = downloaded_file_is_complete(
                                     destination, message, previously_failed=previously_failed
                                 )
@@ -4063,6 +4455,7 @@ class TelegramDownloaderApp:
                                         success = True
                                         outcome = "已有跳过"
                                         created_now = True
+                                        migrated_paths[(folder.name, legacy_destination.name)] = str(destination)
                                         self.log(f"【下载】旧文件名迁移：{legacy_destination.name} → {filename}")
                                     except OSError as exc:
                                         self.log(f"【下载】旧文件名迁移失败：{legacy_destination.name}"
@@ -4079,11 +4472,29 @@ class TelegramDownloaderApp:
                                                     outcome = "预览复用"
                                             except OSError as exc:
                                                 self.log(f"【下载】预览保存失败，尝试正常下载：消息 {message.id}（{type(exc).__name__}: {exc}）")
-                                        if not success:
-                                            returned = await message.download_media(file=str(temporary))
-                                            success = bool(returned) and downloaded_file_is_complete(temporary, message)
-                                            if not success:
-                                                failure = "下载未生成完整文件"
+                                        for attempt_index in range(DOWNLOAD_ATTEMPTS):
+                                            if success:
+                                                break
+                                            try:
+                                                returned = await message.download_media(file=str(temporary))
+                                                success = bool(returned) and downloaded_file_is_complete(temporary, message)
+                                                if not success:
+                                                    failure = "下载未生成完整文件"
+                                            except Exception as exc:
+                                                failure = f"{type(exc).__name__}: {exc}"
+                                                temporary.unlink(missing_ok=True)
+                                                wait = getattr(exc, "seconds", None)
+                                                if isinstance(wait, int) and wait > 0:
+                                                    # FLOOD_WAIT beyond the cap means the account is throttled
+                                                    # for a long while: abort now instead of stalling the batch.
+                                                    if wait > FLOOD_WAIT_MAX_RETRY_SECONDS or attempt_index + 1 >= DOWNLOAD_ATTEMPTS:
+                                                        raise
+                                                    self.log(f"【下载】限流等待 {wait} 秒后重试：消息 {message.id}")
+                                                    await asyncio.sleep(wait)
+                                                elif isinstance(exc, TRANSIENT_DOWNLOAD_ERRORS) and attempt_index + 1 < DOWNLOAD_ATTEMPTS:
+                                                    await asyncio.sleep(1 + attempt_index)
+                                                else:
+                                                    raise
                                         if success:
                                             os.replace(temporary, destination)
                                             created_now = True
@@ -4143,28 +4554,15 @@ class TelegramDownloaderApp:
 
                 self.set_progress(0, 0, "保存结果与抓取状态…")
                 report = group_output / "提取报告.csv"
-                # 多来源旧状态迁移走重建报告：旧报告已备份，来源不明确的行不参与去重也不伪造来源。
-                append_report = (
-                    incremental and not legacy_migration and report.is_file() and report.stat().st_size > 0
-                )
-                existing_report_keys = set() if legacy_migration else read_report_keys(report)
-                new_rows = []
-                for row in rows:
-                    row_key = report_row_key(row)
-                    if row_key in existing_report_keys:
-                        continue
-                    existing_report_keys.add(row_key)
-                    new_rows.append(row)
-                if append_report and not new_rows:
-                    self.log(f"【状态】提取报告无新增行：{report}")
-                else:
-                    with report.open("a" if append_report else "w", newline="", encoding="utf-8-sig") as handle:
-                        writer = csv.writer(handle)
-                        if not append_report:
-                            writer.writerow(REPORT_HEADER)
-                        writer.writerows(new_rows)
-                    self.log(f"【状态】提取报告已{'追加' if append_report else '保存'}：{report}"
-                             + (f"；新增 {len(new_rows)} 行" if append_report else ""))
+                # 报告只是记录：读/写失败不能把已经下载完成的整轮任务判成失败，状态与未匹配备注仍要保存。
+                try:
+                    self._write_extract_report(
+                        report, group_output, rows, legacy_migration,
+                        incremental or subset_capture, migrated_paths,
+                    )
+                except (OSError, ValueError, csv.Error) as exc:
+                    self.log(f"【状态】提取报告写入失败，已跳过本次报告（旧报告保留）："
+                             f"{report}（{type(exc).__name__}: {exc}）")
 
                 labels = list(dict.fromkeys(all_labels))
                 note_matches: dict[str, set[MessageKey]] = defaultdict(set)
@@ -4262,7 +4660,7 @@ class TelegramDownloaderApp:
                     unmatched = [label for label, item in remarks.items() if item["status"] != "已完成"]
                 else:
                     unmatched = [label for label in labels if counts[label] == 0]
-                (group_output / "未匹配备注.txt").write_text("\n".join(unmatched), encoding="utf-8-sig")
+                _atomic_write_text(group_output / "未匹配备注.txt", "\n".join(unmatched), encoding="utf-8-sig")
                 self.log(f"【汇总】待补抓备注（{len(unmatched)}）：{'、'.join(unmatched) or '无'}")
                 return CaptureResult(
                     scanned,
@@ -4705,7 +5103,10 @@ class GroupSettingsDialog:
         if not selection:
             return
         name = self.tree.item(selection[0], "values")[0]
-        profile = next(item for item in self.app.settings["groups"] if item["name"] == name)
+        profile = next((item for item in self.app.settings["groups"] if item["name"] == name), None)
+        if profile is None:
+            messagebox.showwarning("群配置已变化", "该群配置已不存在，请刷新后重新选择。")
+            return
         self.selected_name = name
         self.name.set(name)
         self.address.set(profile["address"])
