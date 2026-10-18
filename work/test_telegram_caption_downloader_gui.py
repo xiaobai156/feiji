@@ -1485,7 +1485,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.3")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.4")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -2441,11 +2441,14 @@ class GuiFlowTests(unittest.TestCase):
         self.app.root.after = original_after
         self.assertEqual(successes, [42])
 
-    def test_clear_output_asks_confirmation_and_keeps_folder_when_cancelled(self):
+    def test_clear_output_clears_every_group_and_date_after_confirmation(self):
         output = Path(self.app_directory.name) / "result"
         nested = output / "测试群" / "大小姐"
         nested.mkdir(parents=True)
         (nested / "image.jpg").write_bytes(b"image")
+        other_group = output / "另一个群" / "其他备注"
+        other_group.mkdir(parents=True)
+        (other_group / "other.jpg").write_bytes(b"image")
         (output / "提取报告.csv").write_text("report", encoding="utf-8")
         self.app.output_path.set(str(output))
 
@@ -2454,6 +2457,7 @@ class GuiFlowTests(unittest.TestCase):
 
         askyesno.assert_called_once()
         self.assertTrue((nested / "image.jpg").is_file())
+        self.assertTrue((other_group / "other.jpg").is_file())
         self.assertTrue((output / "提取报告.csv").is_file())
 
         with patch("telegram_caption_downloader_gui.messagebox.askyesno", return_value=True) as askyesno:
@@ -2462,26 +2466,25 @@ class GuiFlowTests(unittest.TestCase):
         askyesno.assert_called_once()
         self.assertTrue(output.is_dir())
         self.assertEqual(list(output.iterdir()), [])
-        self.assertEqual(self.app.task_status.get(), "已清除结果：2 项")
+        self.assertEqual(self.app.task_status.get(), "已清除结果：3 项")
 
-    def test_clear_output_refuses_when_date_is_invalid(self):
-        output = Path(self.app_directory.name) / "result-invalid-date"
-        group_dir = output / "9.2-测试群"
-        group_dir.mkdir(parents=True)
-        (group_dir / "a.jpg").write_bytes(b"x")
+    def test_clear_output_ignores_selected_group_and_day(self):
+        # 用户要求：不分日期、不分当前选中群，点一次就全清。
+        output = Path(self.app_directory.name) / "result-all"
+        old_day = output / "9.1-测试群" / "2026-09-01"
+        old_day.mkdir(parents=True)
+        (old_day / "old.jpg").write_bytes(b"x")
+        today_dir = output / "9.1-测试群" / "2026-10-18"
+        today_dir.mkdir(parents=True)
+        (today_dir / "today.jpg").write_bytes(b"x")
         save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@a")
         self.app.reload_group_profiles("测试群")
         self.app.output_path.set(str(output))
         self.app.day.set("2026/10/05")
-        with (
-            patch("telegram_caption_downloader_gui.messagebox.showwarning") as warning,
-            patch("telegram_caption_downloader_gui.messagebox.askyesno") as askyesno,
-        ):
+        with patch("telegram_caption_downloader_gui.messagebox.askyesno", return_value=True):
             self.app.clear_output()
-        warning.assert_called_once()
-        askyesno.assert_not_called()
-        # 日期非法时不能回退成清除整个结果根目录。
-        self.assertTrue((group_dir / "a.jpg").is_file())
+        self.assertEqual(list(output.iterdir()), [])
+        self.assertEqual(self.app.task_status.get(), "已清除结果：1 项")
 
     def test_secret_prompt_and_invalid_actions_are_handled(self):
         original_after = self.app.root.after

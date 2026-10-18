@@ -44,7 +44,7 @@ APP_DATA = (
 )
 LEGACY_WORKSPACE = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图")
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.4.3"
+APP_VERSION = "v5.4.4"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DOWNLOAD_CONCURRENCY = 14
@@ -3029,26 +3029,25 @@ class TelegramDownloaderApp:
         if path == Path(path.anchor) or any(path == item or path in item.parents for item in protected):
             messagebox.showwarning("无法清除", "为避免误删，不能清除磁盘根目录、用户目录或软件目录")
             return
-        # Narrow the deletion to the selected group and day whenever both are known.
-        group = self.selected_group_profile(required=False)
-        if group:
-            try:
-                target_day = parse_day(self.day.get())
-            except ValueError:
-                # 日期非法时绝不能回退成清除整个结果根目录。
-                messagebox.showwarning("日期错误", "日期格式应为 YYYY-MM-DD，已取消清除")
-                return
-            scope = dated_group_output(path, target_day, group["name"])
-            scope_label = f"{group['name']} · {target_day.isoformat()}"
-        else:
-            scope = path
-            scope_label = "未选择群：全部群、全部日期"
+        # 用户要求：清除结果一律清空所有群、所有日期，并连带删除各群文件夹。
+        scope = path
+        scope_label = "全部群组 · 全部日期"
         if not scope.is_dir():
             messagebox.showinfo("没有可清除的结果", f"该范围还没有结果目录：\n{scope}")
             return
+        group_names = sorted(
+            item.name for item in scope.iterdir() if item.is_dir() and not item.is_symlink()
+        )
+        if group_names:
+            preview = "\n".join(group_names[:12])
+            if len(group_names) > 12:
+                preview += f"\n… 等共 {len(group_names)} 个群"
+        else:
+            preview = "（结果目录下没有群文件夹）"
         if not messagebox.askyesno(
             "清除结果",
-            f"确定清除以下结果吗？\n\n{scope_label}\n{scope}\n\n删除后无法恢复。",
+            f"确定清除以下结果吗？\n\n{scope_label}\n{scope}\n\n"
+            f"将删除的群文件夹：\n{preview}\n\n删除后无法恢复。",
         ):
             return
         removed = 0
