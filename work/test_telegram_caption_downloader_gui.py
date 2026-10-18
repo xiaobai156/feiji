@@ -23,6 +23,8 @@ from telegram_caption_downloader_gui import (
     GroupSettingsDialog,
     TelegramDownloaderApp,
     delete_group_profile,
+    group_cleanup_targets,
+    purge_group_profile,
     dated_group_output,
     build_download_selection,
     build_selection,
@@ -90,6 +92,7 @@ from telegram_caption_downloader_gui import (
     auto_capture_due,
     normalize_auto_capture_settings,
     load_manual_capture_log,
+    save_manual_capture_log,
     manual_capture_log_path,
     record_manual_capture,
 )
@@ -663,6 +666,31 @@ class CoreLogicTests(unittest.TestCase):
         self.assertTrue(caption_matches_keyword("四头中特 24码中特", "四头中特24码中特", True))
         self.assertFalse(caption_matches_keyword("四头中特24码中特加", "四头中特24码中特", True))
 
+    def test_slash_aliases_are_independent_keywords_not_space_split(self):
+        from telegram_caption_downloader_gui import _notes_from_entries
+        notes = _notes_from_entries(["阿尔法天狼星/阿尔法/天狼星"])
+        self.assertEqual(
+            notes,
+            {"阿尔法天狼星": "阿尔法天狼星", "阿尔法": "阿尔法天狼星", "天狼星": "阿尔法天狼星"},
+        )
+        spaced = _notes_from_entries(["阿尔法天狼星/阿尔法 天狼星"])
+        self.assertEqual(spaced, {"阿尔法天狼星": "阿尔法天狼星", "阿尔法 天狼星": "阿尔法天狼星"})
+
+    def test_alpha_or_sirius_caption_falls_into_alpha_sirius_folder(self):
+        from telegram_caption_downloader_gui import _notes_from_entries
+        notes = _notes_from_entries(["阿尔法天狼星/阿尔法/天狼星"])
+        messages = [
+            SimpleNamespace(id=1, raw_text="阿尔法", grouped_id=None),
+            SimpleNamespace(id=2, raw_text="天狼星", grouped_id=None),
+            SimpleNamespace(id=3, raw_text="阿尔法天狼星", grouped_id=None),
+            SimpleNamespace(id=4, raw_text="阿尔法 天狼星", grouped_id=None),
+            SimpleNamespace(id=5, raw_text="无关备注", grouped_id=None),
+        ]
+        selection = build_selection(messages, notes)
+        for message_id in (1, 2, 3, 4):
+            self.assertEqual(selection[message_id], {"阿尔法天狼星"}, f"消息 {message_id} 未归入阿尔法天狼星")
+        self.assertFalse(selection.get(5))
+
     def test_accounts_use_separate_sessions_and_encrypted_credentials_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1082,6 +1110,93 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(load_group_settings(root)["groups"], [])
             self.assertTrue(new_notes.exists())
 
+    def test_purge_group_profile_removes_config_notes_results_status_and_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "结果"
+            status = root / "outputs" / "抓取状态"
+            logs = root / "outputs" / "运行日志"
+            settings = load_group_settings(root)
+            save_group_profile(root, settings, "", "要删的群", "@gone")
+            save_group_profile(root, settings, "", "留下的群", "@keep")
+            notes = root / "群配置" / "要删的群.json"
+            notes.write_text(json.dumps({"keywords": ["大小姐"]}, ensure_ascii=False), encoding="utf-8")
+            keep_notes = root / "群配置" / "留下的群.json"
+            keep_notes.write_text(json.dumps({"keywords": ["小明"]}, ensure_ascii=False), encoding="utf-8")
+
+            first = output / "10.17-要删的群"
+            second = output / "10.18-要删的群"
+            other = output / "10.18-留下的群"
+            similar = output / "10.18-要删的群2"
+            for folder in (first, second, other, similar):
+                folder.mkdir(parents=True)
+                (folder / "a.jpg").write_bytes(b"x")
+            status.mkdir(parents=True)
+            status_file = status / "要删的群抓取状态.json"
+            status_file.write_text("{}", encoding="utf-8")
+            keep_status = status / "留下的群抓取状态.json"
+            keep_status.write_text("{}", encoding="utf-8")
+            log_dir = logs / "要删的群"
+            log_dir.mkdir(parents=True)
+            (log_dir / "2026-10-18.log").write_text("日志", encoding="utf-8")
+            keep_log = logs / "留下的群"
+            keep_log.mkdir(parents=True)
+            manual = status / "手动抓取日志.json"
+            save_manual_capture_log(manual, {"2026-10-18": ["要删的群", "留下的群"]})
+
+            targets = group_cleanup_targets(root, output, status, logs, "要删的群")
+            labels = [label for label, _path in targets]
+            self.assertIn("备注 JSON", labels)
+            self.assertEqual(labels.count("结果文件夹"), 2)
+            self.assertIn("抓取状态", labels)
+            self.assertIn("运行日志目录", labels)
+
+            removed = purge_group_profile(
+                root, settings, "要删的群", output_root=output, status_root=status, log_root=logs
+            )
+            self.assertEqual(len(removed), 5)
+            self.assertEqual([item["name"] for item in load_group_settings(root)["groups"]], ["留下的群"])
+            self.assertFalse(notes.exists())
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+            self.assertFalse(status_file.exists())
+            self.assertFalse(log_dir.exists())
+            self.assertTrue(keep_notes.exists())
+            self.assertTrue(other.is_dir())
+            self.assertTrue(similar.is_dir())
+            self.assertTrue(keep_status.exists())
+            self.assertTrue(keep_log.is_dir())
+            self.assertEqual(load_manual_capture_log(manual, date(2026, 10, 18)), {"2026-10-18": ["留下的群"]})
+
+    def test_purge_group_profile_refuses_unknown_group_and_keeps_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "结果"
+            status = root / "outputs" / "抓取状态"
+            logs = root / "outputs" / "运行日志"
+            settings = load_group_settings(root)
+            save_group_profile(root, settings, "", "存在的群", "@here")
+            notes = root / "群配置" / "存在的群.json"
+            notes.write_text(json.dumps({"keywords": []}, ensure_ascii=False), encoding="utf-8")
+            folder = output / "10.18-存在的群"
+            folder.mkdir(parents=True)
+
+            with self.assertRaises(ValueError):
+                purge_group_profile(
+                    root, settings, "不存在的群", output_root=output, status_root=status, log_root=logs
+                )
+            self.assertTrue(notes.exists())
+            self.assertTrue(folder.is_dir())
+            self.assertEqual([item["name"] for item in load_group_settings(root)["groups"]], ["存在的群"])
+
+    def test_group_cleanup_targets_ignores_missing_output_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(
+                group_cleanup_targets(root, root / "不存在的结果目录", root / "状态", root / "日志", "空群"),
+                [],
+            )
+
     def test_group_name_validation_rejects_unsafe_windows_names_and_duplicates(self):
         self.assertEqual(validate_group_name("  澳洲六合彩  "), "澳洲六合彩")
         for name in ("", "A/B", "A.", "CON", "com1"):
@@ -1485,7 +1600,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.4")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.5")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -2295,7 +2410,7 @@ class GuiFlowTests(unittest.TestCase):
             self.app.retry_capture()
         start_download.assert_called_once_with(retry=True)
 
-    def test_settings_dialog_adds_renames_and_removes_profile_without_deleting_notes(self):
+    def test_settings_dialog_adds_renames_and_purges_profile_with_notes(self):
         dialog = GroupSettingsDialog(self.app)
         try:
             dialog.name.set("澳洲群")
@@ -2318,13 +2433,60 @@ class GuiFlowTests(unittest.TestCase):
 
             with patch("telegram_caption_downloader_gui.messagebox.askyesno", return_value=True):
                 dialog.delete_item()
-            self.assertTrue(renamed_notes.exists())
+            self.assertFalse(renamed_notes.exists())
             self.assertEqual(self.app.settings["groups"], [])
             with patch("telegram_caption_downloader_gui.os.startfile") as startfile:
                 dialog.open_folder()
                 startfile.assert_called_once()
         finally:
             dialog.window.destroy()
+
+    def test_group_list_right_click_delete_purges_group_files(self):
+        output = Path(self.app_directory.name) / "result"
+        self.app.output_path.set(str(output))
+        save_group_profile(self.app.program_root, self.app.settings, "", "右键群", "@right")
+        save_group_profile(self.app.program_root, self.app.settings, "", "保留群", "@keep")
+        self.app.reload_group_profiles("右键群")
+        notes = self.app.program_root / "群配置" / "右键群.json"
+        notes.write_text(json.dumps({"keywords": ["大小姐"]}, ensure_ascii=False), encoding="utf-8")
+        folder = output / "10.18-右键群"
+        folder.mkdir(parents=True)
+        status_file = capture_status_path(self.app.status_root, "右键群")
+        save_capture_status(status_file, {"group_name": "右键群", "date": "2026-10-18", "remarks": {}})
+        log_dir = self.app.log_root / "右键群"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "2026-10-18.log").write_text("日志", encoding="utf-8")
+
+        self.app.group_list.selection_set("右键群")
+        with patch("telegram_caption_downloader_gui.messagebox.askyesno", return_value=False):
+            self.app.delete_selected_group()
+        self.assertTrue(notes.exists())
+        self.assertTrue(folder.is_dir())
+
+        with patch("telegram_caption_downloader_gui.messagebox.askyesno", return_value=True):
+            self.app.delete_selected_group()
+        self.assertFalse(notes.exists())
+        self.assertFalse(folder.exists())
+        self.assertFalse(status_file.exists())
+        self.assertFalse(log_dir.exists())
+        self.assertEqual([item["name"] for item in self.app.settings["groups"]], ["保留群"])
+        self.assertFalse(self.app.group_list.exists("右键群"))
+        self.assertEqual(self.app.chat.get(), "保留群")
+
+    def test_group_delete_is_blocked_while_a_task_is_running(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "忙碌群", "@busy")
+        self.app.reload_group_profiles("忙碌群")
+        self.app.group_list.selection_set("忙碌群")
+        self.app._busy = True
+        try:
+            with patch("telegram_caption_downloader_gui.messagebox.showinfo") as showinfo, \
+                    patch("telegram_caption_downloader_gui.messagebox.askyesno") as askyesno:
+                self.app.delete_selected_group()
+            showinfo.assert_called_once()
+            askyesno.assert_not_called()
+            self.assertEqual([item["name"] for item in self.app.settings["groups"]], ["忙碌群"])
+        finally:
+            self.app._busy = False
 
     def test_open_notes_uses_selected_groups_same_named_file(self):
         save_group_profile(self.app.program_root, self.app.settings, "", "备注群", "@notes")

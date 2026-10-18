@@ -27,7 +27,9 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
-from tkinter import BooleanVar, Canvas, Frame, StringVar, TclError, Tk, Toplevel, filedialog, messagebox, simpledialog
+from tkinter import (
+    BooleanVar, Canvas, Frame, Menu, StringVar, TclError, Tk, Toplevel, filedialog, messagebox, simpledialog,
+)
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from ctypes import wintypes
@@ -44,7 +46,7 @@ APP_DATA = (
 )
 LEGACY_WORKSPACE = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图")
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.4.4"
+APP_VERSION = "v5.4.5"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DOWNLOAD_CONCURRENCY = 14
@@ -853,6 +855,90 @@ def delete_group_profile(program_root: Path, settings: dict, name: str) -> None:
     if settings.get("selected_group") == name:
         settings["selected_group"] = settings["groups"][0]["name"] if settings["groups"] else ""
     _write_group_settings(program_root, settings)
+
+
+def _group_result_folders(output_root: Path, folder: str) -> list[Path]:
+    """All dated result folders of one group, e.g. 结果\\10.18-嫣然心水."""
+    root = Path(output_root)
+    if not root.is_dir():
+        return []
+    pattern = re.compile(rf"^\d{{1,2}}\.\d{{1,2}}-{re.escape(folder)}$", re.IGNORECASE)
+    return sorted(path for path in root.iterdir() if path.is_dir() and pattern.match(path.name))
+
+
+def group_cleanup_targets(
+    program_root: Path,
+    output_root: Path,
+    status_root: Path,
+    log_root: Path,
+    group_name: str,
+) -> list[tuple[str, Path]]:
+    """Everything that permanently deleting one group removes, existing paths only."""
+    name = validate_group_name(group_name)
+    folder = safe_folder_name(name)
+    candidates: list[tuple[str, Path]] = [
+        ("备注 JSON", group_notes_path(program_root, name)),
+        ("旧备注 TXT", _legacy_group_notes_path(program_root, name)),
+        ("抓取状态", capture_status_path(status_root, name)),
+        ("运行日志目录", Path(log_root) / folder),
+    ]
+    candidates.extend(("结果文件夹", path) for path in _group_result_folders(output_root, folder))
+    return [(label, path) for label, path in candidates if path.exists()]
+
+
+def purge_group_profile(
+    program_root: Path,
+    settings: dict,
+    name: str,
+    *,
+    output_root: Path,
+    status_root: Path,
+    log_root: Path,
+) -> list[Path]:
+    """Delete one group's config, notes, results, status and logs; return removed paths."""
+    name = validate_group_name(name)
+    targets = group_cleanup_targets(program_root, output_root, status_root, log_root, name)
+    allowed = [
+        (Path(program_root) / GROUP_DIR_NAME).resolve(),
+        Path(status_root).resolve(),
+        Path(log_root).resolve(),
+        Path(output_root).resolve(),
+    ]
+    for _label, path in targets:
+        resolved = path.resolve()
+        if not any(resolved != root and resolved.is_relative_to(root) for root in allowed):
+            raise ValueError(f"删除路径不在允许范围内：{path}")
+    delete_group_profile(program_root, settings, name)
+    removed: list[Path] = []
+    for _label, path in targets:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except FileNotFoundError:
+            continue
+        removed.append(path)
+    _forget_manual_capture(status_root, name)
+    return removed
+
+
+def _forget_manual_capture(status_root: Path, group_name: str) -> None:
+    """Drop a deleted group from the shared manual-capture log; failures are not fatal."""
+    path = manual_capture_log_path(status_root)
+    if not path.is_file():
+        return
+    try:
+        days = load_manual_capture_log(path, datetime.now(CN_TZ).date())
+        changed = False
+        for day, groups in list(days.items()):
+            if group_name in groups:
+                days[day] = [item for item in groups if item != group_name]
+                changed = True
+        if changed:
+            save_manual_capture_log(path, {day: groups for day, groups in days.items() if groups})
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
 
 
 def safe_folder_name(text: str) -> str:
@@ -2257,6 +2343,17 @@ class TelegramDownloaderApp:
         list_scroll.pack(side="right", fill="y", padx=(6, 0))
         self.group_list.configure(yscrollcommand=list_scroll.set)
         self.group_list.bind("<<TreeviewSelect>>", self.on_group_list_selected)
+        self.group_list.bind("<Button-3>", self._show_group_menu)
+        self.group_menu = Menu(
+            self.root,
+            tearoff=False,
+            background=DARK_SURFACE,
+            foreground=DARK_TEXT,
+            activebackground=DARK_BORDER,
+            activeforeground=DARK_TEXT,
+            bd=0,
+        )
+        self.group_menu.add_command(label="删除群组（永久删除）", command=self.delete_selected_group)
         ttk.Label(col1, text="工具", style="PanelSection.TLabel").pack(anchor="w", pady=(16, 6))
         self.group_button = ttk.Button(col1, text="群组设置", style="Tool.TButton", command=self.open_group_settings)
         self.group_button.pack(fill="x", pady=4)
@@ -2422,6 +2519,67 @@ class TelegramDownloaderApp:
 
     def selected_group_address(self) -> str:
         return self.selected_group_profile()["address"]
+
+    def _show_group_menu(self, event) -> None:
+        if self._busy:
+            self.log("【群组】任务进行中，暂时不能删除群组")
+            return
+        row = self.group_list.identify_row(event.y)
+        if not row:
+            return
+        self.group_list.selection_set(row)
+        try:
+            self.group_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.group_menu.grab_release()
+
+    def delete_selected_group(self) -> None:
+        """Permanently delete the right-clicked group: config, notes, results, status and logs."""
+        if self._busy:
+            messagebox.showinfo("任务进行中", "请等待当前任务结束或先关闭窗口后再删除群组。", parent=self.root)
+            return
+        selection = self.group_list.selection()
+        name = selection[0] if selection else ""
+        if not name:
+            messagebox.showwarning("请选择群组", "请先在左侧列表中右键选择要删除的群组。", parent=self.root)
+            return
+        try:
+            output_root = Path(self.output_path.get().strip().strip('"')).expanduser()
+        except (OSError, ValueError):
+            output_root = self.program_root
+        try:
+            targets = group_cleanup_targets(
+                self.program_root, output_root, self.status_root, self.log_root, name
+            )
+        except (OSError, ValueError) as exc:
+            messagebox.showwarning("无法删除", str(exc), parent=self.root)
+            return
+        lines = [f"确定永久删除「{name}」吗？以下内容会一起删除，无法恢复：", ""]
+        lines.append("· 群配置条目（groups.json）")
+        for label, path in targets:
+            lines.append(f"· {label}：{path}")
+        if not targets:
+            lines.append("（该群目前没有备注、结果、状态或日志文件）")
+        if not messagebox.askyesno("删除群组", "\n".join(lines), parent=self.root, icon="warning"):
+            return
+        try:
+            removed = purge_group_profile(
+                self.program_root,
+                self.settings,
+                name,
+                output_root=output_root,
+                status_root=self.status_root,
+                log_root=self.log_root,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            messagebox.showwarning("删除失败", str(exc), parent=self.root)
+            self.log(f"【群组】删除「{name}」失败：{exc}")
+            return
+        # Reload before logging: the deleted group's log directory is gone, and
+        # writing first would recreate it.
+        self.reload_group_profiles()
+        self.update_first_capture_status()
+        self.log(f"【群组】已永久删除「{name}」：清理 {len(removed)} 项（配置、备注、结果、状态、日志）")
 
     def on_group_list_selected(self, _event=None) -> None:
         if self._busy:
@@ -5160,17 +5318,43 @@ class GroupSettingsDialog:
         if not self.selected_name:
             messagebox.showwarning("请选择", "请先选择要删除的群配置", parent=self.window)
             return
-        if not messagebox.askyesno(
-            "删除群配置",
-            f"确定删除“{self.selected_name}”的配置吗？\n对应备注 JSON 会保留，不会删除。",
-            parent=self.window,
-        ):
+        if self.app._busy:
+            messagebox.showinfo("任务进行中", "请等待当前任务结束后再删除群组。", parent=self.window)
             return
-        deleted = self.selected_name
-        delete_group_profile(self.app.program_root, self.app.settings, deleted)
+        name = self.selected_name
+        try:
+            output_root = Path(self.app.output_path.get().strip().strip('"')).expanduser()
+        except (OSError, ValueError):
+            output_root = self.app.program_root
+        try:
+            targets = group_cleanup_targets(
+                self.app.program_root, output_root, self.app.status_root, self.app.log_root, name
+            )
+        except (OSError, ValueError) as exc:
+            messagebox.showwarning("无法删除", str(exc), parent=self.window)
+            return
+        lines = [f"确定永久删除「{name}」吗？以下内容会一起删除，无法恢复：", "", "· 群配置条目（groups.json）"]
+        lines.extend(f"· {label}：{path}" for label, path in targets)
+        if not targets:
+            lines.append("（该群目前没有备注、结果、状态或日志文件）")
+        if not messagebox.askyesno("删除群组", "\n".join(lines), parent=self.window, icon="warning"):
+            return
+        try:
+            removed = purge_group_profile(
+                self.app.program_root,
+                self.app.settings,
+                name,
+                output_root=output_root,
+                status_root=self.app.status_root,
+                log_root=self.app.log_root,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            messagebox.showwarning("删除失败", str(exc), parent=self.window)
+            return
         self.new_item()
         self.app.reload_group_profiles()
         self.refresh()
+        self.app.log(f"【群组】已永久删除「{name}」：清理 {len(removed)} 项（配置、备注、结果、状态、日志）")
 
     def open_folder(self) -> None:
         self.app._open_with_shell(group_directory(self.app.program_root))
