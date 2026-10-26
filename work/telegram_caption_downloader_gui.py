@@ -46,7 +46,7 @@ APP_DATA = (
 )
 LEGACY_WORKSPACE = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图")
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.4.6"
+APP_VERSION = "v5.4.7"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DOWNLOAD_CONCURRENCY = 14
@@ -651,6 +651,9 @@ def validate_group_name(value: str) -> str:
         raise ValueError('群名称不能包含 \\ / : * ? " < > |，也不能以空格或句点结尾')
     if name.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
         raise ValueError("该群名称是 Windows 保留名称，请更换")
+    if f"{name}.json".casefold() == GROUP_SETTINGS_NAME.casefold():
+        # 备注文件与 groups.json 同路径会互相覆盖，极端情况下会丢掉全部群配置。
+        raise ValueError(f"群名称不能是 {GROUP_SETTINGS_NAME}，会与群配置文件重名")
     return name
 
 
@@ -866,6 +869,17 @@ def _group_result_folders(output_root: Path, folder: str) -> list[Path]:
     return sorted(path for path in root.iterdir() if path.is_dir() and pattern.match(path.name))
 
 
+def resolve_output_root(value: str) -> Path:
+    """保存目录必须是已填写的绝对路径：空值会退化成当前工作目录，绝不能拿它去删文件。"""
+    text = (value or "").strip().strip('"').strip()
+    if not text:
+        raise ValueError("保存目录为空，请先在主界面填写保存目录")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"保存目录必须是绝对路径：{text}")
+    return path
+
+
 def group_cleanup_targets(
     program_root: Path,
     output_root: Path,
@@ -883,7 +897,13 @@ def group_cleanup_targets(
         ("运行日志目录", Path(log_root) / folder),
     ]
     candidates.extend(("结果文件夹", path) for path in _group_result_folders(output_root, folder))
-    return [(label, path) for label, path in candidates if path.exists()]
+    # groups.json 是整个群列表本体，同名群（如「groups」）的备注路径会与它撞车，必须排除。
+    settings_file = (Path(program_root) / GROUP_DIR_NAME / GROUP_SETTINGS_NAME).resolve()
+    return [
+        (label, path)
+        for label, path in candidates
+        if path.exists() and path.resolve() != settings_file
+    ]
 
 
 def purge_group_profile(
@@ -894,9 +914,14 @@ def purge_group_profile(
     output_root: Path,
     status_root: Path,
     log_root: Path,
-) -> list[Path]:
-    """Delete one group's config, notes, results, status and logs; return removed paths."""
+) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """先删文件、全部成功后再删配置，避免「配置已删、文件残留」的半完成状态。
+
+    返回 (已删除路径, [(失败路径, 原因)])。有失败时保留配置，用户可以再试一次。
+    """
     name = validate_group_name(name)
+    if not any(item.get("name") == name for item in settings.get("groups", [])):
+        raise ValueError(f"要删除的群配置不存在：{name}")
     targets = group_cleanup_targets(program_root, output_root, status_root, log_root, name)
     allowed = [
         (Path(program_root) / GROUP_DIR_NAME).resolve(),
@@ -908,8 +933,8 @@ def purge_group_profile(
         resolved = path.resolve()
         if not any(resolved != root and resolved.is_relative_to(root) for root in allowed):
             raise ValueError(f"删除路径不在允许范围内：{path}")
-    delete_group_profile(program_root, settings, name)
     removed: list[Path] = []
+    failed: list[tuple[Path, str]] = []
     for _label, path in targets:
         try:
             if path.is_dir():
@@ -918,9 +943,16 @@ def purge_group_profile(
                 path.unlink()
         except FileNotFoundError:
             continue
+        except OSError as exc:
+            failed.append((path, f"{type(exc).__name__}: {exc}"))
+            continue
         removed.append(path)
+    if failed:
+        # 文件没删干净就不动配置：留着群条目，用户处理掉占用后可以再删一次。
+        return removed, failed
+    delete_group_profile(program_root, settings, name)
     _forget_manual_capture(status_root, name)
-    return removed
+    return removed, []
 
 
 def _forget_manual_capture(status_root: Path, group_name: str) -> None:
@@ -2544,10 +2576,7 @@ class TelegramDownloaderApp:
             messagebox.showwarning("请选择群组", "请先在左侧列表中右键选择要删除的群组。", parent=self.root)
             return
         try:
-            output_root = Path(self.output_path.get().strip().strip('"')).expanduser()
-        except (OSError, ValueError):
-            output_root = self.program_root
-        try:
+            output_root = resolve_output_root(self.output_path.get())
             targets = group_cleanup_targets(
                 self.program_root, output_root, self.status_root, self.log_root, name
             )
@@ -2560,10 +2589,12 @@ class TelegramDownloaderApp:
             lines.append(f"· {label}：{path}")
         if not targets:
             lines.append("（该群目前没有备注、结果、状态或日志文件）")
+        lines.append("")
+        lines.append(f"结果目录只清理当前保存目录：{output_root}")
         if not messagebox.askyesno("删除群组", "\n".join(lines), parent=self.root, icon="warning"):
             return
         try:
-            removed = purge_group_profile(
+            removed, failed = purge_group_profile(
                 self.program_root,
                 self.settings,
                 name,
@@ -2574,6 +2605,18 @@ class TelegramDownloaderApp:
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             messagebox.showwarning("删除失败", str(exc), parent=self.root)
             self.log(f"【群组】删除「{name}」失败：{exc}")
+            return
+        if failed:
+            # 文件没删干净就不删配置：群仍在列表里，处理掉占用后可以再删一次。
+            detail = "\n".join(f"· {path}（{reason}）" for path, reason in failed[:10])
+            more = f"\n… 共 {len(failed)} 项失败" if len(failed) > 10 else ""
+            self.log(f"【群组】删除「{name}」未完成：{len(failed)} 项被占用，群配置已保留")
+            messagebox.showwarning(
+                "删除未完成",
+                f"以下内容删除失败（可能被程序占用）：\n\n{detail}{more}\n\n"
+                f"群配置已保留，处理掉占用后可以再删一次。已删除 {len(removed)} 项。",
+                parent=self.root,
+            )
             return
         # Reload before logging: the deleted group's log directory is gone, and
         # writing first would recreate it.
@@ -5319,10 +5362,7 @@ class GroupSettingsDialog:
             return
         name = self.selected_name
         try:
-            output_root = Path(self.app.output_path.get().strip().strip('"')).expanduser()
-        except (OSError, ValueError):
-            output_root = self.app.program_root
-        try:
+            output_root = resolve_output_root(self.app.output_path.get())
             targets = group_cleanup_targets(
                 self.app.program_root, output_root, self.app.status_root, self.app.log_root, name
             )
@@ -5333,10 +5373,12 @@ class GroupSettingsDialog:
         lines.extend(f"· {label}：{path}" for label, path in targets)
         if not targets:
             lines.append("（该群目前没有备注、结果、状态或日志文件）")
+        lines.append("")
+        lines.append(f"结果目录只清理当前保存目录：{output_root}")
         if not messagebox.askyesno("删除群组", "\n".join(lines), parent=self.window, icon="warning"):
             return
         try:
-            removed = purge_group_profile(
+            removed, failed = purge_group_profile(
                 self.app.program_root,
                 self.app.settings,
                 name,
@@ -5346,6 +5388,17 @@ class GroupSettingsDialog:
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             messagebox.showwarning("删除失败", str(exc), parent=self.window)
+            return
+        if failed:
+            detail = "\n".join(f"· {path}（{reason}）" for path, reason in failed[:10])
+            more = f"\n… 共 {len(failed)} 项失败" if len(failed) > 10 else ""
+            self.app.log(f"【群组】删除「{name}」未完成：{len(failed)} 项被占用，群配置已保留")
+            messagebox.showwarning(
+                "删除未完成",
+                f"以下内容删除失败（可能被程序占用）：\n\n{detail}{more}\n\n"
+                f"群配置已保留，处理掉占用后可以再删一次。已删除 {len(removed)} 项。",
+                parent=self.window,
+            )
             return
         self.new_item()
         self.app.reload_group_profiles()

@@ -1152,9 +1152,10 @@ class CoreLogicTests(unittest.TestCase):
             self.assertIn("抓取状态", labels)
             self.assertIn("运行日志目录", labels)
 
-            removed = purge_group_profile(
+            removed, failed = purge_group_profile(
                 root, settings, "要删的群", output_root=output, status_root=status, log_root=logs
             )
+            self.assertEqual(failed, [])
             self.assertEqual(len(removed), 5)
             self.assertEqual([item["name"] for item in load_group_settings(root)["groups"]], ["留下的群"])
             self.assertFalse(notes.exists())
@@ -1197,6 +1198,71 @@ class CoreLogicTests(unittest.TestCase):
                 group_cleanup_targets(root, root / "不存在的结果目录", root / "状态", root / "日志", "空群"),
                 [],
             )
+
+    def test_purge_keeps_config_when_a_file_is_locked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "结果"
+            status = root / "outputs" / "抓取状态"
+            logs = root / "outputs" / "运行日志"
+            settings = load_group_settings(root)
+            save_group_profile(root, settings, "", "占用的群", "@locked")
+            notes = root / "群配置" / "占用的群.json"
+            notes.write_text(json.dumps({"keywords": []}, ensure_ascii=False), encoding="utf-8")
+            folder = output / "10.18-占用的群"
+            folder.mkdir(parents=True)
+            (folder / "a.jpg").write_bytes(b"x")
+
+            real_rmtree = gui.shutil.rmtree
+
+            def locked_rmtree(path, *args, **kwargs):
+                if Path(path) == folder:
+                    raise PermissionError(32, "另一个程序正在使用此文件")
+                return real_rmtree(path, *args, **kwargs)
+
+            with patch.object(gui.shutil, "rmtree", side_effect=locked_rmtree):
+                removed, failed = purge_group_profile(
+                    root, settings, "占用的群", output_root=output, status_root=status, log_root=logs
+                )
+            # 文件删不掉就不能动配置，否则用户没法重试。
+            self.assertEqual([path for path, _reason in failed], [folder])
+            self.assertIn("PermissionError", failed[0][1])
+            self.assertEqual([item["name"] for item in load_group_settings(root)["groups"]], ["占用的群"])
+            self.assertTrue(notes.exists())
+            self.assertTrue(folder.is_dir())
+            self.assertIn(notes, removed)
+
+            # 占用解除后可以正常重试
+            removed, failed = purge_group_profile(
+                root, settings, "占用的群", output_root=output, status_root=status, log_root=logs
+            )
+            self.assertEqual(failed, [])
+            self.assertEqual(load_group_settings(root)["groups"], [])
+
+    def test_purge_never_deletes_the_group_settings_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "结果"
+            status = root / "outputs" / "抓取状态"
+            logs = root / "outputs" / "运行日志"
+            settings = load_group_settings(root)
+            save_group_profile(root, settings, "", "普通群", "@normal")
+            settings_file = root / "群配置" / "groups.json"
+            before = settings_file.read_bytes()
+
+            # 即使存在一个备注路径与 groups.json 相同的群，也不能把它列为删除目标。
+            targets = group_cleanup_targets(root, output, status, logs, "普通群")
+            self.assertNotIn(settings_file.resolve(), [path.resolve() for _label, path in targets])
+            self.assertEqual(settings_file.read_bytes(), before)
+
+    def test_resolve_output_root_rejects_empty_or_relative_path(self):
+        with self.assertRaises(ValueError):
+            gui.resolve_output_root("")
+        with self.assertRaises(ValueError):
+            gui.resolve_output_root("   ")
+        with self.assertRaises(ValueError):
+            gui.resolve_output_root("结果")
+        self.assertEqual(gui.resolve_output_root('  "C:\\temp\\结果" '), Path("C:\\temp\\结果"))
 
     def test_group_name_validation_rejects_unsafe_windows_names_and_duplicates(self):
         self.assertEqual(validate_group_name("  澳洲六合彩  "), "澳洲六合彩")
@@ -1601,7 +1667,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.6")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.7")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
