@@ -46,7 +46,7 @@ APP_DATA = (
 )
 LEGACY_WORKSPACE = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图")
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.4.5"
+APP_VERSION = "v5.4.6"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DOWNLOAD_CONCURRENCY = 14
@@ -2802,18 +2802,17 @@ class TelegramDownloaderApp:
                 self.log(f"【自动抓取】{context['group_name']}：{status}")
         else:
             config["threshold_met_date"] = day
+            # 用户规则：图片数达标即算今日已完成，第二次抓取只服务于「没达到最低图片数」。
+            # 备注没匹配上属于结果问题，交给同日复抓，不再触发第三次自动扫描。
+            config["captured_date"] = day
+            status = (
+                f"自动抓取完成：发现 {result.discovered_images} 张，已达到最低 "
+                f"{context['minimum']} 张；成功 {result.downloaded} 张"
+            )
             if result.failed_images or result.unmatched:
-                config["captured_date"] = ""
-                status = (
-                    f"自动抓取未完成：发现 {result.discovered_images} 张，扫描已达标；"
-                    f"成功 {result.downloaded} 张，下载失败 {result.failed_images} 张，"
-                    f"待补抓备注 {result.unmatched} 项，请使用同日复抓"
-                )
-            else:
-                config["captured_date"] = day
-                status = (
-                    f"自动抓取完成：发现 {result.discovered_images} 张，已达到最低 "
-                    f"{context['minimum']} 张；成功 {result.downloaded} 张"
+                status += (
+                    f"；下载失败 {result.failed_images} 张、待补抓备注 {result.unmatched} 项，"
+                    "如需补齐请使用同日复抓"
                 )
             self.log(f"【自动抓取】{context['group_name']}：{status}")
         try:
@@ -4836,12 +4835,9 @@ class TelegramDownloaderApp:
             if scheduled:
                 self._finish_auto_capture(result)
                 return
-            if (
-                not self._workflow_mode
-                and notes_override is None
-                and not result.failed_images
-                and not result.unmatched
-            ):
+            # 用户规则：手动抓过就算今天抓过，不再要求所有备注都匹配成功；
+            # 备注没匹配上由「同日复抓」补，不再触发当天的自动抓取。
+            if not self._workflow_mode and notes_override is None:
                 try:
                     recorded = record_manual_capture(
                         manual_capture_log_path(self.status_root), group_name, target_day

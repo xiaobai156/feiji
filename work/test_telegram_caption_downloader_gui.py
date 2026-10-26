@@ -1142,7 +1142,8 @@ class CoreLogicTests(unittest.TestCase):
             keep_log = logs / "留下的群"
             keep_log.mkdir(parents=True)
             manual = status / "手动抓取日志.json"
-            save_manual_capture_log(manual, {"2026-10-18": ["要删的群", "留下的群"]})
+            today = datetime.now(gui.CN_TZ).date()
+            save_manual_capture_log(manual, {today.isoformat(): ["要删的群", "留下的群"]})
 
             targets = group_cleanup_targets(root, output, status, logs, "要删的群")
             labels = [label for label, _path in targets]
@@ -1166,7 +1167,7 @@ class CoreLogicTests(unittest.TestCase):
             self.assertTrue(similar.is_dir())
             self.assertTrue(keep_status.exists())
             self.assertTrue(keep_log.is_dir())
-            self.assertEqual(load_manual_capture_log(manual, date(2026, 10, 18)), {"2026-10-18": ["留下的群"]})
+            self.assertEqual(load_manual_capture_log(manual, today), {today.isoformat(): ["留下的群"]})
 
     def test_purge_group_profile_refuses_unknown_group_and_keeps_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1600,7 +1601,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.5")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.6")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -4713,7 +4714,7 @@ class CaptureRecoveryTests(unittest.TestCase):
     def status(self):
         return load_capture_status(capture_status_path(self.app.status_root, "Recovery"))
 
-    def test_manual_failure_then_successful_retry_records_and_skips_auto_capture(self):
+    def test_manual_capture_always_skips_the_same_day_auto_capture(self):
         self.day = datetime.now(gui.CN_TZ).date()
         message = self.message(1, fail=True)
         message.date = datetime(self.day.year, self.day.month, self.day.day, 12, tzinfo=gui.CN_TZ)
@@ -4723,11 +4724,12 @@ class CaptureRecoveryTests(unittest.TestCase):
             profile["auto_capture"] = normalize_auto_capture_settings(dict(
                 enabled=True, first_time="18:00", second_time="22:00", min_images=1000,
             ))
+            # 用户规则：手动抓过就算今天抓过，即使有下载失败也不再自动抓取。
             self.app.start_download()
-            self.assertFalse(path.exists())
+            self.assertEqual(load_manual_capture_log(path, self.day), {self.day.isoformat(): ["Recovery"]})
             with patch.object(self.app, "_begin_auto_capture") as begin:
                 self.app._check_auto_capture_schedule(datetime(self.day.year, self.day.month, self.day.day, 18, tzinfo=gui.CN_TZ))
-                self.assertEqual(begin.call_count, 1)
+                begin.assert_not_called()
             message.fail = False
             self.app.start_download(retry=True)
             self.assertEqual(load_manual_capture_log(path, self.day), {self.day.isoformat(): ["Recovery"]})
@@ -4735,21 +4737,32 @@ class CaptureRecoveryTests(unittest.TestCase):
                 self.app._check_auto_capture_schedule(datetime(self.day.year, self.day.month, self.day.day, 22, tzinfo=gui.CN_TZ))
                 begin.assert_not_called()
 
-    def test_incomplete_workflow_and_subset_success_do_not_mark_manual_group_complete(self):
+    def test_workflow_mode_does_not_mark_manual_group_complete(self):
         self.day = datetime.now(gui.CN_TZ).date()
         path = manual_capture_log_path(self.app.status_root)
         with self.capture({"@a": []}, ["known"]):
-            for kind in ("unmatched", "failed", "workflow", "subset"):
-                with self.subTest(kind=kind):
-                    self.app._workflow_mode = kind == "workflow"
-                    result = gui.CaptureResult(1, 1, int(kind == "unmatched"), 1, Path("unused"), 1, 1,
-                                               failed_images=int(kind == "failed"))
-                    with patch.object(self.app, "run_worker", side_effect=lambda operation, success, **kw: success(result)), \
-                         patch.object(self.app, "_workflow_finish"):
-                        self.app.start_download(notes_override={"known": "known"} if kind == "subset" else None)
-                        self.root.update()
-                    self.assertFalse(path.exists())
-            self.app._workflow_mode = False
+            # 定时工作流跑批不是「手动抓取」，不能占用当天手动抓取标记。
+            self.app._workflow_mode = True
+            result = gui.CaptureResult(1, 1, 0, 1, Path("unused"), 1, 1)
+            try:
+                with patch.object(self.app, "run_worker", side_effect=lambda operation, success, **kw: success(result)), \
+                        patch.object(self.app, "_workflow_finish"):
+                    self.app.start_download()
+                    self.root.update()
+            finally:
+                self.app._workflow_mode = False
+            self.assertFalse(path.exists())
+
+    def test_subset_capture_does_not_mark_manual_group_complete(self):
+        self.day = datetime.now(gui.CN_TZ).date()
+        path = manual_capture_log_path(self.app.status_root)
+        with self.capture({"@a": []}, ["known"]):
+            # 只复抓部分备注（notes_override）不算当天完整手动抓取。
+            result = gui.CaptureResult(1, 1, 0, 1, Path("unused"), 1, 1)
+            with patch.object(self.app, "run_worker", side_effect=lambda operation, success, **kw: success(result)):
+                self.app.start_download(notes_override={"known": "known"})
+                self.root.update()
+            self.assertFalse(path.exists())
 
     def test_all_images_retry_recovers_failure_per_source_with_equal_ids(self):
         first, second = self.message(1, fail=True), self.message(1)
@@ -4806,7 +4819,7 @@ class CaptureRecoveryTests(unittest.TestCase):
             self.assertEqual(results[-1].downloaded, 0)
             self.assertEqual(self.status()["remarks"]["known"]["status"], "待复抓")
 
-    def test_auto_partial_download_is_not_completed_or_rescanned_after_threshold_met(self):
+    def test_auto_threshold_met_completes_even_with_failed_downloads(self):
         messages = [self.message(1), self.message(2, fail=True)]
         with self.capture({"@a": messages}, ["known"]):
             profile = self.app.settings["groups"][0]
@@ -4814,7 +4827,8 @@ class CaptureRecoveryTests(unittest.TestCase):
                 enabled=True, first_time="18:00", second_time="22:00", min_images=1,
             ))
             self.app._begin_auto_capture(profile, config, 1, self.day)
-            self.assertEqual(profile["auto_capture"]["captured_date"], "")
+            # 用户规则：图片数达标即算今日完成，第二次抓取只服务于「没达到最低图片数」。
+            self.assertEqual(profile["auto_capture"]["captured_date"], self.day.isoformat())
             self.assertEqual(profile["auto_capture"]["threshold_met_date"], self.day.isoformat())
             self.assertIn("下载失败 1 张", self.app.task_status.get())
             self.assertIsNone(auto_capture_due(profile["auto_capture"], datetime(2026, 10, 5, 22, 0)))
