@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from tkinter import Tk
+from tkinter import Tk, Toplevel
 from tkinter.font import Font
 from PIL import Image
 import telegram_caption_downloader_gui as gui
@@ -1667,7 +1667,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.7")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.8")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -2714,6 +2714,54 @@ class GuiFlowTests(unittest.TestCase):
             self.app.clear_output()
         self.assertEqual(list(output.iterdir()), [])
         self.assertEqual(self.app.task_status.get(), "已清除结果：1 项")
+
+    def test_auto_close_info_dialog_closes_itself_and_can_be_closed_early(self):
+        root = Tk()
+        root.geometry("300x200+80+80")
+        root.deiconify()
+        root.update()
+        try:
+            gui.show_auto_close_info(root, "完成", "内容", seconds=0.2)
+            root.update()
+            windows = [item for item in root.winfo_children() if isinstance(item, Toplevel)]
+            self.assertEqual(len(windows), 1)
+            window = windows[0]
+            # 手动点「确定」要能立刻关掉，不用等 5 秒
+            def find_button(widget):
+                for child in widget.winfo_children():
+                    if hasattr(child, "invoke") and str(child.cget("text")) == "确定":
+                        return child
+                    found = find_button(child)
+                    if found is not None:
+                        return found
+                return None
+
+            ok_button = find_button(window)
+            self.assertIsNotNone(ok_button)
+            ok_button.invoke()
+            root.update()
+            self.assertEqual([item for item in root.winfo_children() if isinstance(item, Toplevel)], [])
+
+            # 不手动关闭时也会自己消失
+            gui.show_auto_close_info(root, "完成", "内容", seconds=0.2)
+            root.update()
+            self.assertEqual(len([i for i in root.winfo_children() if isinstance(i, Toplevel)]), 1)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and any(
+                isinstance(item, Toplevel) for item in root.winfo_children()
+            ):
+                root.update()
+                time.sleep(0.02)
+            self.assertEqual([item for item in root.winfo_children() if isinstance(item, Toplevel)], [])
+        finally:
+            root.destroy()
+
+    def test_auto_close_info_does_nothing_when_parent_hidden(self):
+        # 主窗口不可见时不弹窗，避免测试里堆窗口。
+        self.root.withdraw()
+        self.root.update()
+        gui.show_auto_close_info(self.root, "完成", "内容", seconds=0.1)
+        self.assertEqual([item for item in self.root.winfo_children() if isinstance(item, Toplevel)], [])
 
     def test_secret_prompt_and_invalid_actions_are_handled(self):
         original_after = self.app.root.after

@@ -46,7 +46,7 @@ APP_DATA = (
 )
 LEGACY_WORKSPACE = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图")
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.4.7"
+APP_VERSION = "v5.4.8"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DOWNLOAD_CONCURRENCY = 14
@@ -104,6 +104,73 @@ FLOOD_WAIT_MAX_RETRY_SECONDS = 120
 TRANSIENT_DOWNLOAD_ERRORS = (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError)
 LOG_VIEW_MAX_BYTES = 256 * 1024
 LOGIN_WATCHDOG_MAX_CHECKS = 10
+
+
+AUTO_CLOSE_INFO_SECONDS = 5.0
+
+
+def show_auto_close_info(parent, title: str, message: str, seconds: float = AUTO_CLOSE_INFO_SECONDS) -> None:
+    """信息框：内容和 showinfo 一样，但 seconds 秒后自动关闭，也可以手动点「确定」。
+
+    主窗口不可见（例如测试里 withdraw 掉的 root）时不弹窗，避免测试里堆出窗口。
+    """
+    try:
+        if not parent.winfo_viewable():
+            return
+    except TclError:
+        return
+    window = Toplevel(parent)
+    window.title(title)
+    window.configure(background=DARK_BG)
+    window.resizable(False, False)
+    window.transient(parent)
+
+    body = Frame(window, background=DARK_BG, padx=22, pady=18)
+    body.pack(fill="both", expand=True)
+    ttk.Label(body, text="ⓘ", style="PanelTitle.TLabel", font=("Microsoft YaHei UI", 22)).pack(
+        side="left", anchor="n", padx=(0, 14)
+    )
+    ttk.Label(
+        body,
+        text=message,
+        style="PanelField.TLabel",
+        justify="left",
+        wraplength=460,
+    ).pack(side="left", fill="both", expand=True)
+
+    timer: dict[str, str | None] = {"id": None}
+
+    def close() -> None:
+        if timer["id"] is not None:
+            try:
+                window.after_cancel(timer["id"])
+            except TclError:
+                pass
+            timer["id"] = None
+        try:
+            window.grab_release()
+        except TclError:
+            pass
+        try:
+            window.destroy()
+        except TclError:
+            pass
+
+    buttons = Frame(window, background=DARK_BG, pady=12)
+    buttons.pack(fill="x")
+    ttk.Button(buttons, text="确定", style="Tool.TButton", command=close).pack()
+    window.protocol("WM_DELETE_WINDOW", close)
+
+    window.update_idletasks()
+    width, height = window.winfo_width(), window.winfo_height()
+    x = parent.winfo_rootx() + max((parent.winfo_width() - width) // 2, 0)
+    y = parent.winfo_rooty() + max((parent.winfo_height() - height) // 2, 0)
+    window.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    try:
+        window.grab_set()
+    except TclError:
+        pass
+    timer["id"] = window.after(int(seconds * 1000), close)
 
 
 def thread_stack_dump() -> str:
@@ -4900,7 +4967,8 @@ class TelegramDownloaderApp:
             if self._workflow_mode:
                 self.root.after(0, lambda: self._workflow_finish(0))
             else:
-                messagebox.showinfo(
+                show_auto_close_info(
+                    self.root,
                     "复抓完成" if retry else "提取完成",
                     f"扫描消息：{scanned}\n提取图片：{downloaded}\n下载失败：{result.failed_images}\n未匹配备注：{unmatched}\n\n结果：{result_path}",
                 )
