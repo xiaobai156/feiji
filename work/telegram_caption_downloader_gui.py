@@ -48,7 +48,7 @@ APP_DATA = (
 )
 LEGACY_WORKSPACE = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图")
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.4.10"
+APP_VERSION = "v5.4.11"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DOWNLOAD_CONCURRENCY = 14
@@ -97,6 +97,10 @@ WINDOW_PRESETS = {"2k": (1600, 960), "1080": (1440, 860)}
 WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))
 }
+# 每次泵最多处理这么多界面回调：下载期间每张图都会产生几条日志回调，
+# 无上限地排空队列会让 Tk 主线程长期占在循环里，点「停止」的点击事件永远轮不到，
+# 表现就是「点了停止还在不停抓取」。
+UI_PUMP_MAX_CALLBACKS = 200
 UI_HEARTBEAT_SECONDS = 1.0
 UI_FREEZE_SECONDS = 5.0
 UI_FREEZE_DUMP_COOLDOWN = 30.0
@@ -3879,9 +3883,11 @@ class TelegramDownloaderApp:
             except TclError:
                 pass
             self._ui_pump_id = None
+        handled = 0
         try:
-            while True:
+            while handled < UI_PUMP_MAX_CALLBACKS:
                 callback = self._ui_queue.get_nowait()
+                handled += 1
                 try:
                     callback()
                 except Exception as exc:
@@ -4953,6 +4959,8 @@ class TelegramDownloaderApp:
 
                 matched_total = 0
                 for source_index, address in enumerate(source_order, 1):
+                    if self._cancel_event.is_set():
+                        raise TaskCancelled("已停止抓取")
                     self.log(f"【识别】链接 {source_index}/{len(source_order)}：{address}")
                     source_selection, source_cache = prepare_source(address)
                     source_selections[address] = source_selection
@@ -5079,12 +5087,18 @@ class TelegramDownloaderApp:
                             # 关窗口后不再发起新下载：进程随即退出，本次进度作废，不做任何成功计数。
                             return
                         async with semaphore:
+                            # 停止检查必须在拿到并发槽之后再做一次：gather 会一次性把所有消息
+                            # 都排进队列，进队时检查一遍等于没检查，点了停止还会把剩下的一千张全下完。
+                            if self._cancel_event.is_set():
+                                return
                             ext = message.file.ext if message.file else ".jpg"
                             if not ext or not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", ext):
                                 ext = ".jpg"
                             stamp = message.date.astimezone(CN_TZ).strftime("%Y%m%d_%H%M%S")
                             filename = f"{stamp}_{source_tag(address)}_{message.id}{ext.lower()}"
                             for label in sorted(labels):
+                                if self._cancel_event.is_set():
+                                    return
                                 folder = group_output / label_folder_names.get(label, safe_folder_name(label))
                                 try:
                                     folder.mkdir(parents=True, exist_ok=True)
@@ -5132,6 +5146,9 @@ class TelegramDownloaderApp:
                                         for attempt_index in range(DOWNLOAD_ATTEMPTS):
                                             if success:
                                                 break
+                                            if self._cancel_event.is_set():
+                                                # 点了停止：不再重试这一张，留给下次复抓。
+                                                return
                                             try:
                                                 returned = await message.download_media(file=str(temporary))
                                                 success = bool(returned) and downloaded_file_is_complete(temporary, message)
@@ -5187,6 +5204,8 @@ class TelegramDownloaderApp:
                             write_checkpoint()
 
                     for address in source_order:
+                        if self._cancel_event.is_set():
+                            break
                         source_selection = source_selections.get(address, {})
                         source_cache = source_preview_caches.get(address, {})
                         await asyncio.gather(

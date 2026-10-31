@@ -1679,7 +1679,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.10")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.11")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -5060,6 +5060,45 @@ class CaptureRecoveryTests(unittest.TestCase):
             self.assertFalse(staging_output_path(output).exists())
             events = runtime_log_path(self.app.log_root, datetime.now().date(), "Recovery").read_text(encoding="utf-8")
             self.assertIn("【停止】已按要求停止", events)
+
+    def test_ui_pump_stops_after_a_bounded_batch_so_clicks_are_handled(self):
+        # 下载期间每张图都会产生日志回调：泵必须限量排空，否则 Tk 主线程一直卡在循环里，
+        # 点「停止」的点击事件永远轮不到（v5.4.10 的真实故障之一）。
+        ran = []
+        for index in range(gui.UI_PUMP_MAX_CALLBACKS + 50):
+            self.app._ui_queue.put(lambda index=index: ran.append(index))
+        self.app._pump_ui_callbacks()
+        self.assertEqual(len(ran), gui.UI_PUMP_MAX_CALLBACKS)
+        self.app._pump_ui_callbacks()
+        self.assertEqual(len(ran), gui.UI_PUMP_MAX_CALLBACKS + 50)
+
+    def test_stop_prevents_the_already_queued_downloads_from_running(self):
+        # gather 会一次性把整群消息都排进并发队列：停止必须让排队中的那些不再发起下载，
+        # 否则点了停止还会把剩下的几百上千张全下完（v5.4.10 之前的真实故障）。
+        messages = [self.message(index) for index in range(1, 41)]
+        with self.capture({"@a": messages}, ["known"]):
+            first = messages[0]
+            real_download = first.download_media
+
+            async def download_then_cancel(file):
+                result = await real_download(file)
+                self.app._cancel_event.set()
+                return result
+
+            first.download_media = download_then_cancel
+            with self.assertRaises(TaskCancelled):
+                self.app.start_download()
+            started = [message.id for message in messages if message.calls]
+            self.assertLess(len(started), len(messages))
+            self.assertEqual([message.id for message in messages[20:] if message.calls], [])
+
+    def test_stop_during_recognition_aborts_before_any_download(self):
+        messages = [self.message(1)]
+        with self.capture({"@a": messages}, ["known"]):
+            self.app._cancel_event.set()
+            with self.assertRaises(TaskCancelled):
+                self.app.start_download()
+            self.assertEqual(messages[0].calls, 0)
 
     def test_failed_downloads_write_a_failure_list_in_the_result_folder(self):
         good, bad = self.message(1), self.message(2, fail=True)
