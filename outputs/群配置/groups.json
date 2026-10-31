@@ -4,7 +4,19 @@
       "name": "嫣然心水",
       "address": "https://t.me/lhcxinshui",
       "start_time": "00:00",
-      "end_time": "23:59"
+      "end_time": "23:59",
+      "auto_capture": {
+        "enabled": true,
+        "first_time": "20:25",
+        "second_time": "20:40",
+        "min_images": 300,
+        "last_discovered_images": 361,
+        "last_discovered_date": "2026-10-30",
+        "first_attempt_date": "2026-10-30",
+        "second_attempt_date": "",
+        "threshold_met_date": "2026-10-30",
+        "captured_date": "2026-10-30"
+      }
     },
     {
       "name": "新澳六合彩资料",
@@ -16,12 +28,12 @@
         "first_time": "18:35",
         "second_time": "19:05",
         "min_images": 1000,
-        "last_discovered_images": 0,
-        "last_discovered_date": "2026-10-16",
-        "first_attempt_date": "2026-10-16",
-        "second_attempt_date": "2026-10-16",
-        "threshold_met_date": "",
-        "captured_date": ""
+        "last_discovered_images": 1034,
+        "last_discovered_date": "2026-10-28",
+        "first_attempt_date": "2026-10-28",
+        "second_attempt_date": "2026-10-28",
+        "threshold_met_date": "2026-10-28",
+        "captured_date": "2026-10-28"
       }
     },
     {
@@ -34,12 +46,12 @@
         "first_time": "17:30",
         "second_time": "18:25",
         "min_images": 170,
-        "last_discovered_images": 0,
-        "last_discovered_date": "2026-10-16",
-        "first_attempt_date": "2026-10-16",
-        "second_attempt_date": "2026-10-16",
-        "threshold_met_date": "",
-        "captured_date": ""
+        "last_discovered_images": 200,
+        "last_discovered_date": "2026-10-28",
+        "first_attempt_date": "2026-10-28",
+        "second_attempt_date": "2026-10-28",
+        "threshold_met_date": "2026-10-28",
+        "captured_date": "2026-10-28"
       }
     },
     {
@@ -52,12 +64,12 @@
         "first_time": "20:10",
         "second_time": "20:25",
         "min_images": 500,
-        "last_discovered_images": 682,
-        "last_discovered_date": "2026-10-16",
-        "first_attempt_date": "2026-10-16",
+        "last_discovered_images": 698,
+        "last_discovered_date": "2026-10-30",
+        "first_attempt_date": "2026-10-30",
         "second_attempt_date": "",
-        "threshold_met_date": "2026-10-16",
-        "captured_date": ""
+        "threshold_met_date": "2026-10-30",
+        "captured_date": "2026-10-30"
       }
     },
     {
@@ -70,12 +82,12 @@
         "first_time": "19:20",
         "second_time": "19:40",
         "min_images": 1100,
-        "last_discovered_images": 1336,
-        "last_discovered_date": "2026-10-16",
-        "first_attempt_date": "2026-10-16",
+        "last_discovered_images": 1327,
+        "last_discovered_date": "2026-10-30",
+        "first_attempt_date": "2026-10-30",
         "second_attempt_date": "",
-        "threshold_met_date": "2026-10-16",
-        "captured_date": ""
+        "threshold_met_date": "2026-10-30",
+        "captured_date": "2026-10-30"
       }
     },
     {
@@ -88,15 +100,94 @@
         "first_time": "19:45",
         "second_time": "19:55",
         "min_images": 600,
-        "last_discovered_images": 839,
-        "last_discovered_date": "2026-10-16",
-        "first_attempt_date": "2026-10-16",
+        "last_discovered_images": 888,
+        "last_discovered_date": "2026-10-30",
+        "first_attempt_date": "2026-10-30",
         "second_attempt_date": "",
-        "threshold_met_date": "2026-10-16",
-        "captured_date": ""
+        "threshold_met_date": "2026-10-30",
+        "captured_date": "2026-10-30"
       }
+    },
+    {
+      "name": "黑色六合彩",
+      "address": "https://t.me/amlhc818",
+      "start_time": "00:00",
+      "end_time": "21:00",
+      "auto_capture": {
+        "enabled": true,
+        "first_time": "16:45",
+        "second_time": "16:55",
+        "min_images": 100,
+        "last_discovered_images": 323,
+        "last_discovered_date": "2026-10-29",
+        "first_attempt_date": "2026-10-29",
+        "second_attempt_date": "2026-10-29",
+        "threshold_met_date": "2026-10-29",
+        "captured_date": "2026-10-29"
+      }
+    },
+    {
+      "name": "嫣然资料",
+      "address": "https://t.me/lhhhc",
+      "start_time": "00:00",
+      "end_time": "23:59"
+    },
+    {
+      "name": "嫣然精选",
+      "address": "https://t.me/lhcye",
+      "start_time": "00:00",
+      "end_time": "23:59"
+    },
+    {
+      "name": "嫣然六合彩",
+      "address": "https://t.me/amlhcdbq",
+      "start_time": "00:00",
+      "end_time": "23:59",
+      "auto_capture": {
+        "enabled": false,
+        "first_time": "17:00",
+        "second_time": "17:10",
+        "min_images": 200,
+        "last_discovered_images": 442,
+        "last_discovered_date": "2026-10-27",
+        "first_attempt_date": "2026-10-27",
+        "second_attempt_date": "",
+        "threshold_met_date": "2026-10-27",
+        "captured_date": "2026-10-27"
+      }
+    },
+    {
+      "name": "黄大仙第二",
+      "address": "https://t.me/lhcxinao",
+      "start_time": "00:00",
+      "end_time": "23:59"
+    },
+    {
+      "name": "嫣然电报",
+      "address": "https://t.me/lhc88686",
+      "start_time": "00:00",
+      "end_time": "23:59",
+      "auto_capture": {
+        "enabled": true,
+        "first_time": "16:00",
+        "second_time": "16:30",
+        "min_images": 100,
+        "last_discovered_images": 668,
+        "last_discovered_date": "2026-10-30",
+        "first_attempt_date": "2026-10-30",
+        "second_attempt_date": "2026-10-30",
+        "threshold_met_date": "2026-10-30",
+        "captured_date": "2026-10-30"
+      }
+    },
+    {
+      "name": "嫣然六合彩大全",
+      "address": "https://t.me/LHChaha",
+      "start_time": "00:00",
+      "end_time": "12:00"
     }
   ],
-  "selected_group": "新澳高级会员",
-  "output_path": "C:\\Users\\Administrator\\Desktop\\每天工具\\飞机抓图\\结果"
+  "selected_group": "嫣然六合彩大全",
+  "output_path": "C:\\Users\\Administrator\\Desktop\\每天工具\\飞机抓图\\结果",
+  "data_root": "C:\\Users\\Administrator\\Desktop\\每天工具\\飞机抓图"
 }

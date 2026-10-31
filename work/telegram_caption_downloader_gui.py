@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -24,6 +25,7 @@ import unicodedata
 import webbrowser
 from uuid import uuid4
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
@@ -46,7 +48,7 @@ APP_DATA = (
 )
 LEGACY_WORKSPACE = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图")
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.4.8"
+APP_VERSION = "v5.4.9"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DOWNLOAD_CONCURRENCY = 14
@@ -103,7 +105,84 @@ DOWNLOAD_ATTEMPTS = 2
 FLOOD_WAIT_MAX_RETRY_SECONDS = 120
 TRANSIENT_DOWNLOAD_ERRORS = (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError)
 LOG_VIEW_MAX_BYTES = 256 * 1024
+LOG_VIEW_MAX_LINES = 3000
+LOG_KEEP_DAYS = 7
+CHECKPOINT_SECONDS = 20.0
+STAGING_OUTPUT_SUFFIX = "__下载中"
 LOGIN_WATCHDOG_MAX_CHECKS = 10
+
+
+class TaskCancelled(Exception):
+    """用户点了停止：不是错误，UI 上按「已停止」处理。"""
+
+
+class PreviewStore(Mapping):
+    """预览图缓存：内存只留索引，字节落到临时目录。
+
+    大群一次可能命中几百张原图，全留在内存里会吃掉几百 MB；这里把字节写到
+    临时文件，按需读回，进程退出或对象回收时整个目录删掉。
+    """
+
+    def __init__(self) -> None:
+        self._directory = Path(tempfile.mkdtemp(prefix="tgc_preview_"))
+        self._paths: dict[int, Path] = {}
+
+    def __setitem__(self, key: int, value: bytes) -> None:
+        message_id = int(key)
+        path = self._directory / f"{message_id}.bin"
+        path.write_bytes(value)
+        self._paths[message_id] = path
+
+    def __getitem__(self, key: int) -> bytes:
+        return self._paths[int(key)].read_bytes()
+
+    def __contains__(self, key: object) -> bool:
+        try:
+            return int(key) in self._paths
+        except (TypeError, ValueError):
+            return False
+
+    def __iter__(self):
+        return iter(self._paths)
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+    def get(self, key: int, default=None):
+        try:
+            message_id = int(key)
+        except (TypeError, ValueError):
+            return default
+        path = self._paths.get(message_id)
+        if path is None:
+            return default
+        return path.read_bytes()
+
+    def pop(self, key: int, default=None):
+        try:
+            message_id = int(key)
+        except (TypeError, ValueError):
+            return default
+        path = self._paths.pop(message_id, None)
+        if path is None:
+            return default
+        value = path.read_bytes()
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return value
+
+    def close(self) -> None:
+        shutil.rmtree(self._directory, ignore_errors=True)
+        self._paths.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 
 AUTO_CLOSE_INFO_SECONDS = 5.0
@@ -364,15 +443,22 @@ def project_root() -> Path:
     return runtime_root().parent
 
 
+def default_data_root() -> Path:
+    """数据根目录：旧工作区存在时用它，否则用工程目录。
+
+    只在首次启动（settings 里还没有 data_root）时计算一次，之后固定写入配置，
+    避免旧目录被改名后结果与状态悄悄换位置。
+    """
+    return LEGACY_WORKSPACE if LEGACY_WORKSPACE.is_dir() else project_root()
+
+
 def default_output_path() -> Path:
     """Prefer the historical workspace directory, fall back to the project directory."""
-    return LEGACY_WORKSPACE / "结果" if LEGACY_WORKSPACE.is_dir() else project_root() / "结果"
+    return default_data_root() / "结果"
 
 
 def default_status_root() -> Path:
-    if LEGACY_WORKSPACE.is_dir():
-        return LEGACY_WORKSPACE / "outputs" / "抓取状态"
-    return project_root() / "outputs" / "抓取状态"
+    return default_data_root() / "outputs" / "抓取状态"
 
 
 def normalized(text: str) -> str:
@@ -685,14 +771,15 @@ def runtime_log_path(log_root: Path, target_day: date, group_name: str = "系统
 
 
 def clear_old_runtime_logs(log_root: Path, target_day: date, group_name: str = "系统") -> Path:
-    """Keep only today's log and return the active (empty or existing) file."""
+    """Keep the last LOG_KEEP_DAYS days of logs and return the active file."""
     root = Path(log_root) / safe_folder_name(group_name)
     root.mkdir(parents=True, exist_ok=True)
     active = root / f"{target_day.isoformat()}.log"
     log_base = Path(log_root).resolve()
+    oldest_kept = (target_day - timedelta(days=LOG_KEEP_DAYS - 1)).isoformat()
     for path in list(log_base.glob("*/*.log")) + list(log_base.glob("*.log")):
         if (re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.stem)
-                and path.stem < target_day.isoformat()
+                and path.stem < oldest_kept
                 and path.resolve().is_relative_to(log_base)):
             try:
                 path.unlink()
@@ -773,6 +860,7 @@ def _default_group_settings() -> dict:
         "groups": [],
         "selected_group": "",
         "output_path": str(default_output_path()),
+        "data_root": "",
     }
 
 
@@ -780,7 +868,8 @@ def _write_group_settings(program_root: Path, settings: dict) -> None:
     if settings.get("_load_error"):
         raise ValueError(settings["_load_error"])
     path = group_directory(program_root) / GROUP_SETTINGS_NAME
-    _atomic_write_text(path, json.dumps(settings, ensure_ascii=False, indent=2))
+    payload = {key: value for key, value in settings.items() if not key.startswith("_")}
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def load_group_settings(program_root: Path, *, read_only: bool = False) -> dict:
@@ -791,7 +880,55 @@ def load_group_settings(program_root: Path, *, read_only: bool = False) -> dict:
         if not read_only:
             _write_group_settings(program_root, settings)
         return settings
-    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    text = path.read_text(encoding="utf-8-sig")
+    try:
+        return _parse_group_settings(text, program_root, read_only=read_only)
+    except (json.JSONDecodeError, ValueError) as exc:
+        recovered = _recover_group_settings(program_root, path, exc, read_only=read_only)
+        if recovered is None:
+            raise
+        return recovered
+
+
+def _settings_backup_paths(path: Path) -> list[Path]:
+    """同目录下的 groups.json.bak_* 备份，按文件名倒序（新的在前）。"""
+    try:
+        candidates = [item for item in path.parent.glob(f"{path.name}.bak_*") if item.is_file()]
+    except OSError:
+        return []
+    return sorted(candidates, key=lambda item: item.name, reverse=True)
+
+
+def _recover_group_settings(program_root: Path, path: Path, exc: Exception, *, read_only: bool) -> dict | None:
+    """groups.json 损坏时：先留一份坏文件副本，再尝试用最近的备份恢复。"""
+    stamp = datetime.now(CN_TZ).strftime("%Y%m%d%H%M%S")
+    broken_copy = path.with_name(f"{path.name}.坏文件-{stamp}")
+    try:
+        shutil.copy2(path, broken_copy)
+    except OSError:
+        broken_copy = None
+    for candidate in _settings_backup_paths(path):
+        try:
+            settings = _parse_group_settings(
+                candidate.read_text(encoding="utf-8-sig"), program_root, read_only=True
+            )
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        settings["_recovered_from"] = (
+            f"群配置文件损坏（{type(exc).__name__}: {exc}），已用备份恢复：{candidate.name}"
+            + (f"；坏文件副本：{broken_copy.name}" if broken_copy else "")
+        )
+        if not read_only:
+            try:
+                _atomic_write_text(path, json.dumps(settings, ensure_ascii=False, indent=2))
+            except OSError:
+                pass
+        return settings
+    return None
+
+
+def _parse_group_settings(text: str, program_root: Path, *, read_only: bool) -> dict:
+    payload = json.loads(text)
     if not isinstance(payload, dict) or not isinstance(payload.get("groups"), list):
         raise ValueError("群配置文件格式无效")
     settings = _default_group_settings()
@@ -839,6 +976,8 @@ def load_group_settings(program_root: Path, *, read_only: bool = False) -> dict:
         settings["selected_group"] = payload["selected_group"]
     if isinstance(payload.get("output_path"), str) and payload["output_path"].strip():
         settings["output_path"] = payload["output_path"]
+    if isinstance(payload.get("data_root"), str) and payload["data_root"].strip():
+        settings["data_root"] = payload["data_root"].strip()
     if not read_only:
         for item in groups:
             migrate_group_notes_config(program_root, item["name"])
@@ -1059,6 +1198,35 @@ def _label_folder_names(labels) -> dict[str, str]:
         owners[name.casefold()] = label
         names[label] = name
     return names
+
+
+def staging_output_path(final_output: Path) -> Path:
+    """全量抓取时先写到这个临时目录，成功后再替换正式结果目录。"""
+    final_output = Path(final_output)
+    return final_output.parent / f"{final_output.name}{STAGING_OUTPUT_SUFFIX}"
+
+
+def promote_staged_output(final_output: Path, staging: Path) -> None:
+    """用临时目录替换正式结果目录；替换失败时尽力把旧结果放回去。"""
+    final_output = Path(final_output)
+    staging = Path(staging)
+    backup = final_output.parent / f"{final_output.name}__旧结果"
+    shutil.rmtree(backup, ignore_errors=True)
+    moved_old = False
+    if final_output.exists():
+        os.replace(final_output, backup)
+        moved_old = True
+    try:
+        os.replace(staging, final_output)
+    except OSError:
+        if moved_old and not final_output.exists():
+            try:
+                os.replace(backup, final_output)
+            except OSError:
+                pass
+        raise
+    if moved_old:
+        shutil.rmtree(backup, ignore_errors=True)
 
 
 def dated_group_output(output: Path, target_day: date, group_name: str) -> Path:
@@ -2136,7 +2304,6 @@ class TelegramDownloaderApp:
         self.root = root
         self.app_data = app_data
         self.program_root = Path(program_root) if program_root else runtime_root()
-        self.status_root = Path(status_root) if status_root else default_status_root()
         self._workflow_log_path = Path(workflow_log).expanduser() if workflow_log else None
         notes_errors = []
         try:
@@ -2153,6 +2320,16 @@ class TelegramDownloaderApp:
                     migrate_group_notes_config(self.program_root, profile["name"])
                 except (OSError, ValueError) as exc:
                     notes_errors.append(f"备注配置读取失败，原文件已保留：{group_notes_path(self.program_root, profile['name'])}；{exc}")
+        # 数据根目录只解析一次并写进配置：旧工作区被改名或删除后，结果与状态位置不再悄悄切换。
+        stored_data_root = str(self.settings.get("data_root") or "").strip()
+        self.data_root_pinned = bool(stored_data_root)
+        self.data_root = Path(stored_data_root) if stored_data_root else default_data_root()
+        if not stored_data_root:
+            self.settings["data_root"] = str(self.data_root)
+        self.status_root = (
+            Path(status_root) if status_root is not None
+            else self.data_root / "outputs" / "抓取状态"
+        )
         self.root.title(f"登录飞机提取图片 {APP_VERSION}")
         self.window_preset = self._initial_window_preset()
         window_width, window_height = self._window_size_for_preset(self.window_preset)
@@ -2172,6 +2349,7 @@ class TelegramDownloaderApp:
         self.busy_widgets = []
         self.log_root = self.program_root / RUNTIME_LOG_DIR_NAME
         self._log_lock = threading.RLock()
+        self._log_handles: dict[Path, "io.TextIOWrapper"] = {}
         self._log_day: date | None = None
         self._log_group = "系统"
         self._log_group_written = ""
@@ -2226,8 +2404,14 @@ class TelegramDownloaderApp:
         self._pump_ui_callbacks()
         self.root.after_idle(lambda: self._enable_dark_title_bar(self.root))
         self.reload_group_profiles(self.chat.get())
+        self.log(
+            f"【路径】数据根目录：{self.data_root}（{'已固定' if self.data_root_pinned else '本次固定，已写入群配置'}）；"
+            f"结果目录：{self.output_path.get()}；状态目录：{self.status_root}；日志目录：{self.log_root}"
+        )
         for error in notes_errors:
             self.log(error)
+        if self.settings.get("_recovered_from"):
+            self.log(f"【配置】{self.settings['_recovered_from']}")
         if self.settings.get("_load_error"):
             self.log(self.settings["_load_error"])
             self.task_status.set("群配置读取失败，已禁止覆盖；请修复配置后重启")
@@ -2499,6 +2683,10 @@ class TelegramDownloaderApp:
         self.first_capture_status_label.pack(anchor="w", pady=(4, 10))
         self.retry_button = ttk.Button(col2, text="复抓", style="Tool.TButton", command=self.retry_capture)
         self.retry_button.pack(fill="x", side="bottom")
+        self.stop_button = ttk.Button(
+            col2, text="停止", style="Tool.TButton", command=self.cancel_capture, state="disabled"
+        )
+        self.stop_button.pack(fill="x", side="bottom")
         self.start_button = ttk.Button(col2, text="开始精准提取", style="Accent.TButton", command=self.start_download)
         self.start_button.pack(fill="x", side="bottom", pady=(0, 18))
 
@@ -2660,6 +2848,8 @@ class TelegramDownloaderApp:
         lines.append(f"结果目录只清理当前保存目录：{output_root}")
         if not messagebox.askyesno("删除群组", "\n".join(lines), parent=self.root, icon="warning"):
             return
+        # 删群要删运行日志目录，先把常开的日志句柄放掉，否则 Windows 上删不掉。
+        self._close_log_handles()
         try:
             removed, failed = purge_group_profile(
                 self.program_root,
@@ -3355,6 +3545,17 @@ class TelegramDownloaderApp:
         self.log(f"【复抓】开始复抓嫣然群未匹配备注：{len(notes)} 条。")
         self.start_download(notes_override=notes, retry=True)
 
+    def cancel_capture(self) -> None:
+        """点「停止」：只是设置取消标记，正在跑的 worker 会在下一个检查点退出。"""
+        if not self._busy:
+            return
+        if self._cancel_event.is_set():
+            self.log("【停止】已经在停止中，请稍候…")
+            return
+        self._cancel_event.set()
+        self.task_status.set("正在停止…")
+        self.log("【停止】已收到停止请求：正在收尾当前这一步，本次临时结果会丢弃，当天旧结果保持原样")
+
     def retry_capture(self) -> None:
         group_name = self.chat.get().strip()
         if not group_name:
@@ -3404,6 +3605,8 @@ class TelegramDownloaderApp:
     def _rotate_runtime_log(self, target_day: date | None = None) -> Path:
         today = target_day or datetime.now(CN_TZ).date()
         with self._log_lock:
+            # 换日时先放开句柄，否则旧的 .log 被占用，7 天清理删不掉。
+            self._close_log_handles()
             path = clear_old_runtime_logs(self.log_root, today, self._log_group)
             self._log_day = today
             self._log_group_written = self._log_group
@@ -3443,6 +3646,23 @@ class TelegramDownloaderApp:
         self.root.after(0, clear_view)
         self._schedule_log_rollover()
 
+    def _log_writer(self, path: Path):
+        """Return a kept-open append handle so每行日志不再重复 open/close。"""
+        handle = self._log_handles.get(path)
+        if handle is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a", encoding="utf-8")
+            self._log_handles[path] = handle
+        return handle
+
+    def _close_log_handles(self) -> None:
+        for handle in self._log_handles.values():
+            try:
+                handle.close()
+            except OSError:
+                pass
+        self._log_handles.clear()
+
     def _append_log_file(self, text: str) -> None:
         with self._log_lock:
             try:
@@ -3450,21 +3670,21 @@ class TelegramDownloaderApp:
                 if self._log_day == now.date() and self._log_group_written == self._log_group:
                     # Same day and group as the last rotation: skip the directory rescan.
                     path = runtime_log_path(self.log_root, now.date(), self._log_group)
-                    path.parent.mkdir(parents=True, exist_ok=True)
                 else:
                     path = self._rotate_runtime_log(now.date())
                 stamp = now.strftime("[%H:%M:%S] ")
-                with path.open("a", encoding="utf-8") as handle:
-                    handle.write(stamp + text + "\n")
+                handle = self._log_writer(path)
+                handle.write(stamp + text + "\n")
+                handle.flush()
             except OSError:
-                pass
+                self._close_log_handles()
             try:
                 if self._workflow_log_path is not None:
-                    self._workflow_log_path.parent.mkdir(parents=True, exist_ok=True)
-                    with self._workflow_log_path.open("a", encoding="utf-8") as handle:
-                        handle.write(text + "\n")
+                    handle = self._log_writer(self._workflow_log_path)
+                    handle.write(text + "\n")
+                    handle.flush()
             except OSError:
-                pass
+                self._close_log_handles()
 
     def log(self, text: str) -> None:
         if not text.startswith("【"):
@@ -3474,6 +3694,10 @@ class TelegramDownloaderApp:
         def append() -> None:
             self.log_box.configure(state="normal")
             self.log_box.insert("end", text + "\n")
+            # 面板只留最近 LOG_VIEW_MAX_LINES 行，长跑几天也不会越拖越慢。
+            total = int(self.log_box.index("end-1c").split(".")[0])
+            if total > LOG_VIEW_MAX_LINES:
+                self.log_box.delete("1.0", f"{total - LOG_VIEW_MAX_LINES + 1}.0")
             self.log_box.see("end")
             self.log_box.configure(state="disabled")
 
@@ -3489,6 +3713,10 @@ class TelegramDownloaderApp:
         self._busy = busy
         for widget in self.busy_widgets:
             widget.configure(state="disabled" if busy else self._busy_widget_states.get(widget, "normal"))
+        # 停止按钮不参与 busy_widgets（否则运行中会被一起禁用），单独按忙碌状态切换。
+        stop_button = getattr(self, "stop_button", None)
+        if stop_button is not None:
+            stop_button.configure(state="normal" if busy else "disabled")
         self._update_account_form()
         dialog = getattr(self, "auto_capture_settings_dialog", None)
         if dialog is not None and dialog.window.winfo_exists():
@@ -3510,6 +3738,8 @@ class TelegramDownloaderApp:
             # Stop the download worker from starting new files before the process exits.
             self._cancel_event.set()
             self._stop_capture_progress()
+            # 常开日志句柄必须关掉，否则日志文件被占用、删不掉也传不走。
+            self._close_log_handles()
             if self._auto_capture_timer is not None:
                 try:
                     self.root.after_cancel(self._auto_capture_timer)
@@ -3693,6 +3923,8 @@ class TelegramDownloaderApp:
         """Start the worker thread; returns False when a task is already running."""
         if self._busy:
             return False
+        # 先清停止标记再置忙碌：否则用户在「准备中」阶段点停止会被清掉。
+        self._cancel_event.clear()
         self.set_busy(True, "准备中…")
 
         def worker() -> None:
@@ -3702,6 +3934,20 @@ class TelegramDownloaderApp:
             try:
                 try:
                     result = operation()
+                except TaskCancelled as exc:
+                    message = str(exc) or "已停止抓取"
+                    self.log(f"【停止】任务已停止：{message}")
+                    def stopped(text=message) -> None:
+                        self.set_busy(False, "已停止")
+                        if not self._workflow_mode and self._auto_capture_context is None:
+                            messagebox.showinfo("已停止", text)
+                        if on_failure is not None:
+                            on_failure(text) if self._workflow_mode else on_failure()
+                        elif self._workflow_mode:
+                            self._workflow_fail(text)
+                    self._post_to_main(stopped)
+                    reported = True
+                    return
                 except Exception as exc:
                     error_text = str(exc) or "未知错误"
                     self.log(f"【错误】任务中止：{type(exc).__name__}: {exc}")
@@ -4114,8 +4360,10 @@ class TelegramDownloaderApp:
 
         def operation() -> CaptureResult:
             operation_started = time.monotonic()
-            self._cancel_event.clear()
             group_output = dated_group_output(output, target_day, group_name)
+            final_output = group_output
+            # 上一次中途失败留下的临时目录先清掉，避免混进新结果。
+            shutil.rmtree(staging_output_path(final_output), ignore_errors=True)
             status_enabled = notes_override is None
             # 指定备注（嫣然“复抓未匹配”）只补这些备注的图，绝不能清掉当天其它备注的结果。
             subset_capture = notes_override is not None
@@ -4268,6 +4516,9 @@ class TelegramDownloaderApp:
                 message_sources: dict[int, str] = {}
 
                 def add_message(message, require_new: bool = False, min_id: int = 0) -> None:
+                    if self._cancel_event.is_set():
+                        # 扫描阶段就点停止：直接中止，不进备注匹配和下载。
+                        raise TaskCancelled("已停止抓取")
                     if message is None:
                         return
                     key = (chat_address, getattr(message, "id", None))
@@ -4381,7 +4632,7 @@ class TelegramDownloaderApp:
                     )
 
                 source_selections: dict[str, dict[int, set[str]]] = {}
-                source_preview_caches: dict[str, dict[int, bytes]] = {}
+                source_preview_caches: dict[str, PreviewStore] = {}
                 source_exact_labels: dict[str, set[str]] = {}
                 ignored_note_ids: dict[str, set[MessageKey]] = defaultdict(set)
 
@@ -4430,7 +4681,7 @@ class TelegramDownloaderApp:
                             log=self.log,
                         )
                     )
-                    preview_cache: dict[int, bytes] = {}
+                    preview_cache: PreviewStore = PreviewStore()
                     if visual_adjacent_labels or first_image_ocr_labels or marker_filter_labels:
                         groups = ordered_media_groups(source_media_messages)
                         preview_ids: set[int] = set()
@@ -4480,6 +4731,8 @@ class TelegramDownloaderApp:
                             async def load_preview(message) -> None:
                                 nonlocal preview_done
                                 async with semaphore:
+                                    if self._cancel_event.is_set():
+                                        return
                                     try:
                                         payload = await message.download_media(file=bytes)
                                         if isinstance(payload, bytes):
@@ -4632,9 +4885,13 @@ class TelegramDownloaderApp:
                     f"扫描完成：共发现 {len(media_messages)} 张图片，符合条件 {matched_total} 张",
                 )
                 self.log(f"【扫描】扫描完成：共发现 {len(media_messages)} 张图片，符合条件 {matched_total} 张。")
+                staging_output: Path | None = None
                 if not incremental and not subset_capture and group_output.exists():
-                    self.log(f"【状态】全量抓取覆盖本日期结果目录：{group_output}")
-                    shutil.rmtree(group_output)
+                    # 全量抓取不再先删旧结果：先下载到临时目录，全部成功后再替换正式目录。
+                    staging_output = staging_output_path(group_output)
+                    shutil.rmtree(staging_output, ignore_errors=True)
+                    group_output = staging_output
+                    self.log(f"【状态】全量抓取：旧结果保留，本次先写入临时目录 {group_output}，成功后替换")
                 group_output.mkdir(parents=True, exist_ok=True)
                 if legacy_migration:
                     # 多链接群旧状态属于一次重建：旧文件与旧报告都无法确认来源，不猜来源，
@@ -4673,6 +4930,51 @@ class TelegramDownloaderApp:
                     address: set(ids) for address, ids in source_pending_ids.items()
                 }
                 migrated_paths: dict[str, str] = {}
+                checkpoint_state = {"last": 0.0}
+
+                def write_checkpoint(force: bool = False) -> None:
+                    """下载过程中定期落一份状态：中途崩溃或断电后，复抓不用全量重扫。"""
+                    if not status_enabled or status_path is None:
+                        return
+                    moment = time.monotonic()
+                    if not force and moment - checkpoint_state["last"] < CHECKPOINT_SECONDS:
+                        return
+                    checkpoint_state["last"] = moment
+                    selected_by_label: dict[str, set[MessageKey]] = defaultdict(set)
+                    for addr, selection in source_selections.items():
+                        for message_id, label_set in selection.items():
+                            for label in label_set:
+                                selected_by_label[label].add((addr, message_id))
+                    now_text = datetime.now(CN_TZ).isoformat()
+                    remarks_now = {}
+                    for label, selected_keys in selected_by_label.items():
+                        done = successful_label_ids.get(label, set())
+                        pending = (selected_keys - done) | failed_label_ids.get(label, set())
+                        remarks_now[label] = {
+                            "status": "已完成" if not pending else ("部分完成" if done else "待复抓"),
+                            "image_count": len(done),
+                            "image_messages": message_refs(done),
+                            "pending_messages": message_refs(pending),
+                        }
+                    payload = {
+                        "group_name": group_name,
+                        "date": target_day.isoformat(),
+                        "time_range": f"{start_clock.strftime('%H:%M')} ～ {end_clock.strftime('%H:%M')}",
+                        "first_capture_time": (
+                            previous_status.get("first_capture_time", now_text)
+                            if incremental and previous_status else now_text
+                        ),
+                        "last_capture_time": now_text,
+                        "last_message_id": max([last_message_id, *current_last_ids.values()], default=last_message_id),
+                        "last_message_ids": current_last_ids,
+                        "remarks": remarks_now,
+                        "checkpoint": True,
+                    }
+                    try:
+                        save_capture_status(status_path, payload)
+                    except (OSError, ValueError) as exc:
+                        self.log(f"【状态】检查点保存失败（不影响下载）：{type(exc).__name__}: {exc}")
+
                 self.log(f"【下载】开始：{matched_total} 张待处理，并发 {DOWNLOAD_CONCURRENCY}；结果目录 {group_output}")
                 self.set_progress(0, matched_total, f"正在处理：0 / {matched_total}", phase_started=download_started)
 
@@ -4680,7 +4982,7 @@ class TelegramDownloaderApp:
                     semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 
                     async def download_message(
-                        address: str, message, labels: set[str], preview_cache: dict[int, bytes]
+                        address: str, message, labels: set[str], preview_cache: PreviewStore
                     ) -> None:
                         nonlocal processed
                         key = (address, message.id)
@@ -4793,6 +5095,7 @@ class TelegramDownloaderApp:
                                 matched_total,
                                 f"正在处理：{processed} / {matched_total}", phase_started=download_started,
                             )
+                            write_checkpoint()
 
                     for address in source_order:
                         source_selection = source_selections.get(address, {})
@@ -4919,21 +5222,49 @@ class TelegramDownloaderApp:
                     }
                     try:
                         save_capture_status(status_path, status_payload)
-                    except OSError as exc:
-                        self.log(f"【状态】抓取状态保存失败：{status_path}（{type(exc).__name__}: {exc}）；本次状态未成功更新")
-                        raise
-                    self.log(f"【状态】抓取状态已覆盖保存：{status_path}；日期 {target_day}；备注 {len(remarks)} 个")
+                    except (OSError, ValueError) as exc:
+                        # 图片已经下载完成，状态写失败不能把整轮判成失败：只告警，让用户手动复抓。
+                        self.log(f"【状态】抓取状态保存失败：{status_path}（{type(exc).__name__}: {exc}）；"
+                                 "本次状态未成功更新，图片已下载完成，请用「同日复抓」补齐状态")
+                    else:
+                        self.log(f"【状态】抓取状态已覆盖保存：{status_path}；日期 {target_day}；备注 {len(remarks)} 个")
                     unmatched = [label for label, item in remarks.items() if item["status"] != "已完成"]
                 else:
                     unmatched = [label for label in labels if counts[label] == 0]
                 _atomic_write_text(group_output / "未匹配备注.txt", "\n".join(unmatched), encoding="utf-8-sig")
                 self.log(f"【汇总】待补抓备注（{len(unmatched)}）：{'、'.join(unmatched) or '无'}")
+                failed_lines = []
+                for label, keys in sorted(failed_label_ids.items()):
+                    for address_key, message_id in sorted(keys):
+                        failed_lines.append(f"{label}\t{address_key}\t{message_id}")
+                if failed_lines:
+                    _atomic_write_text(
+                        group_output / "下载失败清单.txt",
+                        "\n".join(failed_lines),
+                        encoding="utf-8-sig",
+                    )
+                    self.log(f"【汇总】下载失败 {len(failed_lines)} 张，清单：{group_output / '下载失败清单.txt'}")
+                else:
+                    stale = group_output / "下载失败清单.txt"
+                    if stale.exists():
+                        try:
+                            stale.unlink()
+                        except OSError:
+                            pass
+                if self._cancel_event.is_set():
+                    if staging_output is not None:
+                        shutil.rmtree(staging_output, ignore_errors=True)
+                    self.log("【停止】已按要求停止：本次临时结果已丢弃，当天旧结果保持原样")
+                    raise TaskCancelled("已停止抓取")
+                if staging_output is not None:
+                    promote_staged_output(final_output, staging_output)
+                    self.log(f"【状态】结果目录已替换为本次抓取内容：{final_output}")
                 return CaptureResult(
                     scanned,
                     len(downloaded_ids),
                     len(unmatched),
                     matched_total,
-                    group_output,
+                    final_output,
                     time.monotonic() - operation_started,
                     discovered_images,
                     failed_images=len(set().union(*failed_label_ids.values())),
@@ -5445,6 +5776,7 @@ class GroupSettingsDialog:
         lines.append(f"结果目录只清理当前保存目录：{output_root}")
         if not messagebox.askyesno("删除群组", "\n".join(lines), parent=self.window, icon="warning"):
             return
+        self.app._close_log_handles()
         try:
             removed, failed = purge_group_profile(
                 self.app.program_root,

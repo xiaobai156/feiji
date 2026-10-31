@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import logging
+import os
 import sys
 import tempfile
 import threading
@@ -25,6 +26,13 @@ from telegram_caption_downloader_gui import (
     delete_group_profile,
     group_cleanup_targets,
     purge_group_profile,
+    staging_output_path,
+    promote_staged_output,
+    PreviewStore,
+    TaskCancelled,
+    default_data_root,
+    LOG_KEEP_DAYS,
+    LOG_VIEW_MAX_LINES,
     dated_group_output,
     build_download_selection,
     build_selection,
@@ -958,10 +966,11 @@ class CoreLogicTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for group in ("嫣然心水", "黄大仙新澳", "系统"):
-                path = clear_old_runtime_logs(root, date(2026, 9, 2), group)
+                # 保留最近 7 天：8-20 距 9-03 已超过 7 天，应当被清掉。
+                path = clear_old_runtime_logs(root, date(2026, 8, 20), group)
                 path.write_text("【限流】FLOOD_WAIT\n【网络】重连\n【汇总】完成", encoding="utf-8")
             clear_old_runtime_logs(root, date(2026, 9, 3), "嫣然心水")
-            self.assertEqual(list(root.rglob("2026-09-02.log")), [])
+            self.assertEqual(list(root.rglob("2026-08-20.log")), [])
             self.assertEqual(runtime_log_path(root, date(2026, 9, 3), "嫣然心水").read_text(), "")
             current = root / "黄大仙新澳" / "2026-09-03.log"
             current.write_text("today", encoding="utf-8")
@@ -1010,7 +1019,10 @@ class CoreLogicTests(unittest.TestCase):
             old.parent.mkdir()
             old.write_text("old", encoding="utf-8")
             active = clear_old_runtime_logs(root, date(2026, 9, 1), "嫣然心水")
-            self.assertEqual(active, runtime_log_path(root, date(2026, 9, 1), "嫣然心水"))
+            # 8-31 在最近 7 天内，保留。
+            self.assertTrue(old.exists())
+            active = clear_old_runtime_logs(root, date(2026, 9, 10), "嫣然心水")
+            self.assertEqual(active, runtime_log_path(root, date(2026, 9, 10), "嫣然心水"))
             self.assertTrue(active.exists())
             self.assertFalse(old.exists())
 
@@ -1667,7 +1679,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.8")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.9")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -4050,10 +4062,11 @@ class GuiFlowTests(unittest.TestCase):
                 patch("telegram_caption_downloader_gui.save_capture_status", side_effect=OSError("test state write failure")),
                 patch("telegram_caption_downloader_gui.messagebox.showinfo"),
             ):
-                with self.assertRaises(OSError):
-                    self.app.start_download()
+                # 状态保存失败只告警，不把已下载完成的整轮任务判成失败。
+                self.app.start_download()
             events = runtime_log_path(self.app.log_root, datetime.now().date(), "测试群").read_text(encoding="utf-8")
             self.assertIn("【状态】抓取状态保存失败：", events)
+            self.assertIn("图片已下载完成，请用「同日复抓」补齐状态", events)
 
 
     def test_same_message_id_from_two_sources_saves_two_files_without_overwrite(self):
@@ -4965,7 +4978,14 @@ class CaptureRecoveryTests(unittest.TestCase):
                     app = TelegramDownloaderApp(root, app_data=base / "data", program_root=program,
                                                 status_root=base / "status", show_account_dialog=False)
                     root.update()
-                    self.assertEqual(group_file.read_bytes(), before_group)
+                    if bad_groups:
+                        self.assertEqual(group_file.read_bytes(), before_group)
+                    else:
+                        # 群配置本身没坏：只允许新增 data_root 固定项，原有群条目必须原样保留。
+                        after_group = json.loads(group_file.read_text(encoding="utf-8"))
+                        before_payload = json.loads(before_group.decode("utf-8"))
+                        self.assertEqual(after_group["groups"], before_payload["groups"])
+                        self.assertTrue(after_group.get("data_root"))
                     self.assertEqual(notes_file.read_bytes(), before_notes)
                     if bad_groups:
                         with self.assertRaises(ValueError):
@@ -5005,6 +5025,68 @@ class CaptureRecoveryTests(unittest.TestCase):
             self.assertEqual(saved["threshold_met_date"], self.day.isoformat())
             self.assertIn("已保存", dialog.save_feedback.get())
 
+
+    def test_full_capture_keeps_old_results_until_new_ones_are_complete(self):
+        message = self.message(1)
+        with self.capture({"@a": [message]}, ["known"]):
+            output = dated_group_output(Path(self.app.output_path.get()), self.day, "Recovery")
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "旧文件.txt").write_text("old", encoding="utf-8")
+            self.app.start_download()
+            # 全量抓取成功后正式目录被本次结果替换，旧内容不再残留，临时目录也不留。
+            self.assertFalse((output / "旧文件.txt").exists())
+            self.assertTrue(list((output / "known").glob("*.jpg")))
+            self.assertFalse(staging_output_path(output).exists())
+
+    def test_stopping_midway_discards_staging_and_keeps_old_results(self):
+        message = self.message(1)
+        with self.capture({"@a": [message]}, ["known"]):
+            output = dated_group_output(Path(self.app.output_path.get()), self.day, "Recovery")
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "旧文件.txt").write_text("old", encoding="utf-8")
+
+            real_download = message.download_media
+
+            async def download_then_cancel(file):
+                result = await real_download(file)
+                # 下载过程中用户点了停止。
+                self.app._cancel_event.set()
+                return result
+
+            message.download_media = download_then_cancel
+            with self.assertRaises(TaskCancelled):
+                self.app.start_download()
+            self.assertEqual((output / "旧文件.txt").read_text(encoding="utf-8"), "old")
+            self.assertFalse(staging_output_path(output).exists())
+            events = runtime_log_path(self.app.log_root, datetime.now().date(), "Recovery").read_text(encoding="utf-8")
+            self.assertIn("【停止】已按要求停止", events)
+
+    def test_failed_downloads_write_a_failure_list_in_the_result_folder(self):
+        good, bad = self.message(1), self.message(2, fail=True)
+        with self.capture({"@a": [good, bad]}, ["known"]):
+            self.app.start_download()
+            output = dated_group_output(Path(self.app.output_path.get()), self.day, "Recovery")
+            failure_list = output / "下载失败清单.txt"
+            self.assertTrue(failure_list.is_file())
+            rows = failure_list.read_text(encoding="utf-8-sig").strip().splitlines()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].split("	"), ["known", "@a", "2"])
+
+    def test_capture_writes_a_checkpoint_during_the_download(self):
+        message = self.message(1)
+        with self.capture({"@a": [message]}, ["known"]):
+            checkpoints = []
+            real_save = gui.save_capture_status
+
+            def spy(path, payload):
+                if payload.get("checkpoint"):
+                    checkpoints.append(payload)
+                return real_save(path, payload)
+
+            with patch.object(gui, "save_capture_status", side_effect=spy):
+                self.app.start_download()
+            self.assertTrue(checkpoints)
+            self.assertTrue(checkpoints[-1]["checkpoint"])
 
     def test_subset_retry_keeps_other_downloads_and_report_rows(self):
         known, other = self.message(1), self.message(2)
@@ -5314,6 +5396,165 @@ class RiskFixRegressionTests(unittest.TestCase):
         self.assertEqual(ocr_labels_from_payload(payload, {"68"}, FakeOCR("6.8码")), set())
         # 原本就有空白的真命中要能救回
         self.assertEqual(ocr_labels_from_payload(payload, {"68"}, FakeOCR("1 68码")), {"68"})
+
+
+class OptimizationRegressionTests(unittest.TestCase):
+    """8 项优化的回归：临时目录替换、数据根固定、检查点、停止、日志、失败清单、配置自愈。"""
+
+    def test_staging_output_replaces_final_only_after_promote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            final = Path(directory) / "10.18-群"
+            staging = staging_output_path(final)
+            self.assertEqual(staging, Path(directory) / "10.18-群__下载中")
+            final.mkdir()
+            (final / "old.txt").write_text("old", encoding="utf-8")
+            staging.mkdir()
+            (staging / "new.txt").write_text("new", encoding="utf-8")
+            promote_staged_output(final, staging)
+            self.assertEqual(sorted(p.name for p in final.iterdir()), ["new.txt"])
+            self.assertFalse(staging.exists())
+            self.assertFalse((Path(directory) / "10.18-群__旧结果").exists())
+
+    def test_staging_promote_restores_old_folder_when_replace_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            final = Path(directory) / "10.18-群"
+            staging = staging_output_path(final)
+            final.mkdir()
+            (final / "old.txt").write_text("old", encoding="utf-8")
+            staging.mkdir()
+            (staging / "new.txt").write_text("new", encoding="utf-8")
+            real_replace = os.replace
+
+            def flaky_replace(source, target):
+                if str(source).endswith("__下载中"):
+                    raise OSError("locked")
+                return real_replace(source, target)
+
+            with patch("telegram_caption_downloader_gui.os.replace", side_effect=flaky_replace):
+                with self.assertRaises(OSError):
+                    promote_staged_output(final, staging)
+            self.assertEqual((final / "old.txt").read_text(encoding="utf-8"), "old")
+
+    def test_preview_store_spills_to_disk_and_cleans_up(self):
+        store = PreviewStore()
+        directory = store._directory
+        store[7] = b"payload"
+        self.assertIn(7, store)
+        self.assertNotIn(8, store)
+        self.assertEqual(store[7], b"payload")
+        self.assertEqual(store.get(7), b"payload")
+        self.assertIsNone(store.get(8))
+        self.assertEqual(len(store), 1)
+        self.assertEqual(list(store), [7])
+        self.assertTrue(directory.is_dir())
+        self.assertEqual(store.pop(7), b"payload")
+        self.assertNotIn(7, store)
+        store[9] = b"x"
+        store.close()
+        self.assertFalse(directory.exists())
+
+    def test_data_root_is_pinned_into_group_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app_root = root / "program"
+            status_root = root / "status"
+            tk = Tk()
+            tk.withdraw()
+            try:
+                app = TelegramDownloaderApp(tk, app_data=root / "data", program_root=app_root,
+                                            status_root=status_root, show_account_dialog=False)
+                tk.update()
+                self.assertTrue(app.data_root_pinned is False)
+                self.assertEqual(app.data_root, default_data_root())
+                self.assertEqual(Path(app.settings["data_root"]), default_data_root())
+                saved = json.loads((app_root / "群配置" / "groups.json").read_text(encoding="utf-8"))
+                self.assertEqual(Path(saved["data_root"]), default_data_root())
+                app.log_box.delete("1.0", "end")
+            finally:
+                tk.destroy()
+            tk = Tk()
+            tk.withdraw()
+            try:
+                again = TelegramDownloaderApp(tk, app_data=root / "data", program_root=app_root,
+                                              status_root=status_root, show_account_dialog=False)
+                tk.update()
+                self.assertTrue(again.data_root_pinned)
+                self.assertEqual(again.data_root, default_data_root())
+            finally:
+                tk.destroy()
+
+    def test_log_view_keeps_only_the_latest_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tk = Tk()
+            tk.withdraw()
+            try:
+                app = TelegramDownloaderApp(tk, app_data=Path(directory) / "data",
+                                            program_root=Path(directory) / "program",
+                                            status_root=Path(directory) / "status",
+                                            show_account_dialog=False)
+                tk.update()
+                for index in range(LOG_VIEW_MAX_LINES + 120):
+                    app.log(f"【测试】第 {index} 行")
+                tk.update()
+                app._pump_ui_queue() if hasattr(app, "_pump_ui_queue") else None
+                tk.update()
+                total = int(app.log_box.index("end-1c").split(".")[0])
+                self.assertLessEqual(total, LOG_VIEW_MAX_LINES + 1)
+                app.log("【测试】最后一行")
+                tk.update()
+                content = app.log_box.get("1.0", "end")
+                self.assertIn("最后一行", content)
+            finally:
+                tk.destroy()
+
+    def test_stop_button_requests_cancel_and_reports_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tk = Tk()
+            tk.withdraw()
+            try:
+                app = TelegramDownloaderApp(tk, app_data=Path(directory) / "data",
+                                            program_root=Path(directory) / "program",
+                                            status_root=Path(directory) / "status",
+                                            show_account_dialog=False)
+                tk.update()
+                self.assertEqual(str(app.stop_button.cget("state")), "disabled")
+                app.set_busy(True, "运行中")
+                self.assertEqual(str(app.stop_button.cget("state")), "normal")
+                app.cancel_capture()
+                self.assertTrue(app._cancel_event.is_set())
+                self.assertEqual(app.task_status.get(), "正在停止…")
+                app.set_busy(False)
+                self.assertEqual(str(app.stop_button.cget("state")), "disabled")
+
+                def operation():
+                    raise TaskCancelled("已停止抓取")
+
+                with patch("telegram_caption_downloader_gui.messagebox.showinfo") as showinfo,                         patch("telegram_caption_downloader_gui.messagebox.showerror") as showerror:
+                    app.run_worker(operation, lambda result: None)
+                    for _ in range(200):
+                        tk.update()
+                        if not app._busy:
+                            break
+                        time.sleep(0.01)
+                showerror.assert_not_called()
+                showinfo.assert_called_once()
+                self.assertEqual(app.task_status.get(), "已停止")
+            finally:
+                tk.destroy()
+
+    def test_group_settings_recovers_from_backup_when_json_is_broken(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = load_group_settings(root)
+            save_group_profile(root, settings, "", "备份群", "@backup")
+            group_file = root / "群配置" / "groups.json"
+            backup = group_file.with_name(group_file.name + ".bak_20260101")
+            backup.write_bytes(group_file.read_bytes())
+            group_file.write_text('{"broken":', encoding="utf-8")
+            recovered = load_group_settings(root)
+            self.assertEqual([item["name"] for item in recovered["groups"]], ["备份群"])
+            self.assertTrue(recovered.get("_recovered_from"))
+            self.assertEqual(list((root / "群配置").glob("groups.json.坏文件-*")).__len__(), 1)
 
 
 if __name__ == "__main__":
