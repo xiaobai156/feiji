@@ -48,7 +48,7 @@ APP_DATA = (
 )
 LEGACY_WORKSPACE = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图")
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-APP_VERSION = "v5.4.9"
+APP_VERSION = "v5.4.10"
 GROUP_DIR_NAME = "群配置"
 GROUP_SETTINGS_NAME = "groups.json"
 DOWNLOAD_CONCURRENCY = 14
@@ -109,6 +109,8 @@ LOG_VIEW_MAX_LINES = 3000
 LOG_KEEP_DAYS = 7
 CHECKPOINT_SECONDS = 20.0
 STAGING_OUTPUT_SUFFIX = "__下载中"
+OUTPUT_BACKUP_SUFFIX = "__旧结果"
+PROMOTE_FAILED_SUFFIX = "__本次结果"
 LOGIN_WATCHDOG_MAX_CHECKS = 10
 
 
@@ -864,11 +866,34 @@ def _default_group_settings() -> dict:
     }
 
 
+def _backup_group_settings(path: Path, *, keep: int = 7) -> None:
+    """每次写 groups.json 前留一份当天备份：写坏了还能靠它自愈。"""
+    if not path.is_file():
+        return
+    stamp = datetime.now(CN_TZ).strftime("%Y%m%d")
+    backup = path.parent / f"{path.name}.bak_{stamp}"
+    if not backup.exists():
+        try:
+            shutil.copy2(path, backup)
+        except OSError:
+            return
+    try:
+        extras = sorted(path.parent.glob(f"{path.name}.bak_*"), key=lambda item: item.name, reverse=True)
+    except OSError:
+        return
+    for stale in extras[keep:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
 def _write_group_settings(program_root: Path, settings: dict) -> None:
     if settings.get("_load_error"):
         raise ValueError(settings["_load_error"])
     path = group_directory(program_root) / GROUP_SETTINGS_NAME
     payload = {key: value for key, value in settings.items() if not key.startswith("_")}
+    _backup_group_settings(path)
     _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -1206,11 +1231,47 @@ def staging_output_path(final_output: Path) -> Path:
     return final_output.parent / f"{final_output.name}{STAGING_OUTPUT_SUFFIX}"
 
 
+def output_backup_path(final_output: Path) -> Path:
+    """promote 过程中旧结果临时挪到的位置。"""
+    final_output = Path(final_output)
+    return final_output.parent / f"{final_output.name}{OUTPUT_BACKUP_SUFFIX}"
+
+
+def recover_pending_promotions(output_root: Path) -> list[Path]:
+    """启动时扫一遍结果根目录，把上次崩溃留下的「旧结果」放回缺位的正式目录。"""
+    root = Path(output_root)
+    if not root.is_dir():
+        return []
+    restored: list[Path] = []
+    try:
+        candidates = sorted(root.glob(f"*{OUTPUT_BACKUP_SUFFIX}"))
+    except OSError:
+        return []
+    for backup in candidates:
+        final_output = backup.with_name(backup.name[: -len(OUTPUT_BACKUP_SUFFIX)])
+        if recover_interrupted_promotion(final_output):
+            restored.append(final_output)
+    return restored
+
+
+def recover_interrupted_promotion(final_output: Path) -> bool:
+    """上次 promote 在换目录途中崩溃：正式目录不见了，就把旧结果放回去。"""
+    final_output = Path(final_output)
+    backup = output_backup_path(final_output)
+    if final_output.exists() or not backup.is_dir():
+        return False
+    try:
+        os.replace(backup, final_output)
+    except OSError:
+        return False
+    return True
+
+
 def promote_staged_output(final_output: Path, staging: Path) -> None:
-    """用临时目录替换正式结果目录；替换失败时尽力把旧结果放回去。"""
+    """用临时目录替换正式结果目录；失败时把旧结果放回去，并保住本次下载的图片。"""
     final_output = Path(final_output)
     staging = Path(staging)
-    backup = final_output.parent / f"{final_output.name}__旧结果"
+    backup = output_backup_path(final_output)
     shutil.rmtree(backup, ignore_errors=True)
     moved_old = False
     if final_output.exists():
@@ -1218,13 +1279,24 @@ def promote_staged_output(final_output: Path, staging: Path) -> None:
         moved_old = True
     try:
         os.replace(staging, final_output)
-    except OSError:
+    except OSError as exc:
         if moved_old and not final_output.exists():
             try:
                 os.replace(backup, final_output)
             except OSError:
                 pass
-        raise
+        # 本次下载的图还在 staging 里：换个名字留住，免得下次启动当成残留临时目录删掉。
+        kept = staging
+        try:
+            kept = staging.with_name(
+                f"{final_output.name}{PROMOTE_FAILED_SUFFIX}-{datetime.now(CN_TZ).strftime('%H%M%S')}"
+            )
+            staging.rename(kept)
+        except OSError:
+            kept = staging
+        raise RuntimeError(
+            f"结果目录替换失败（{type(exc).__name__}: {exc}）；本次下载的图片已保留在：{kept}"
+        ) from exc
     if moved_old:
         shutil.rmtree(backup, ignore_errors=True)
 
@@ -2408,6 +2480,12 @@ class TelegramDownloaderApp:
             f"【路径】数据根目录：{self.data_root}（{'已固定' if self.data_root_pinned else '本次固定，已写入群配置'}）；"
             f"结果目录：{self.output_path.get()}；状态目录：{self.status_root}；日志目录：{self.log_root}"
         )
+        try:
+            restored = recover_pending_promotions(Path(self.output_path.get().strip().strip('"')).expanduser())
+        except (OSError, ValueError):
+            restored = []
+        for path in restored:
+            self.log(f"【恢复】上次替换结果目录时中断，已把旧结果放回：{path}")
         for error in notes_errors:
             self.log(error)
         if self.settings.get("_recovered_from"):
@@ -4362,6 +4440,9 @@ class TelegramDownloaderApp:
             operation_started = time.monotonic()
             group_output = dated_group_output(output, target_day, group_name)
             final_output = group_output
+            # 上次在替换结果目录途中崩溃：正式目录不见了，先把旧结果放回去再继续。
+            if recover_interrupted_promotion(final_output):
+                self.log(f"【恢复】上次替换结果目录时中断，已把旧结果放回：{final_output}")
             # 上一次中途失败留下的临时目录先清掉，避免混进新结果。
             shutil.rmtree(staging_output_path(final_output), ignore_errors=True)
             status_enabled = notes_override is None
@@ -4886,12 +4967,16 @@ class TelegramDownloaderApp:
                 )
                 self.log(f"【扫描】扫描完成：共发现 {len(media_messages)} 张图片，符合条件 {matched_total} 张。")
                 staging_output: Path | None = None
-                if not incremental and not subset_capture and group_output.exists():
-                    # 全量抓取不再先删旧结果：先下载到临时目录，全部成功后再替换正式目录。
+                if not incremental and not subset_capture:
+                    # 全量抓取（含当天第一次）都先写临时目录，全部成功后再替换正式目录：
+                    # 否则首次抓取中途停止/崩溃，半成品会留在正式目录被当成完整结果。
                     staging_output = staging_output_path(group_output)
                     shutil.rmtree(staging_output, ignore_errors=True)
                     group_output = staging_output
-                    self.log(f"【状态】全量抓取：旧结果保留，本次先写入临时目录 {group_output}，成功后替换")
+                    if final_output.exists():
+                        self.log(f"【状态】全量抓取：旧结果保留，本次先写入临时目录 {group_output}，成功后替换")
+                    else:
+                        self.log(f"【状态】全量抓取：本次先写入临时目录 {group_output}，成功后替换为 {final_output}")
                 group_output.mkdir(parents=True, exist_ok=True)
                 if legacy_migration:
                     # 多链接群旧状态属于一次重建：旧文件与旧报告都无法确认来源，不猜来源，
@@ -4935,6 +5020,10 @@ class TelegramDownloaderApp:
                 def write_checkpoint(force: bool = False) -> None:
                     """下载过程中定期落一份状态：中途崩溃或断电后，复抓不用全量重扫。"""
                     if not status_enabled or status_path is None:
+                        return
+                    if staging_output is not None:
+                        # 图还在临时目录里，尚未替换正式目录：此时写正式状态会导致
+                        # 崩溃/停止后状态说已下载、图却被丢弃。全量抓取改为落定后一次写入。
                         return
                     moment = time.monotonic()
                     if not force and moment - checkpoint_state["last"] < CHECKPOINT_SECONDS:
@@ -5203,6 +5292,7 @@ class TelegramDownloaderApp:
                         "pending_messages": message_refs(pending_ids),
                     }
 
+                status_payload = None
                 if status_enabled:
                     now = datetime.now(CN_TZ).isoformat()
                     all_ids = [message.id for message in all_messages]
@@ -5220,16 +5310,9 @@ class TelegramDownloaderApp:
                         "last_message_ids": current_last_ids,
                         "remarks": remarks,
                     }
-                    try:
-                        save_capture_status(status_path, status_payload)
-                    except (OSError, ValueError) as exc:
-                        # 图片已经下载完成，状态写失败不能把整轮判成失败：只告警，让用户手动复抓。
-                        self.log(f"【状态】抓取状态保存失败：{status_path}（{type(exc).__name__}: {exc}）；"
-                                 "本次状态未成功更新，图片已下载完成，请用「同日复抓」补齐状态")
-                    else:
-                        self.log(f"【状态】抓取状态已覆盖保存：{status_path}；日期 {target_day}；备注 {len(remarks)} 个")
                     unmatched = [label for label, item in remarks.items() if item["status"] != "已完成"]
                 else:
+                    status_payload = None
                     unmatched = [label for label in labels if counts[label] == 0]
                 _atomic_write_text(group_output / "未匹配备注.txt", "\n".join(unmatched), encoding="utf-8-sig")
                 self.log(f"【汇总】待补抓备注（{len(unmatched)}）：{'、'.join(unmatched) or '无'}")
@@ -5259,6 +5342,17 @@ class TelegramDownloaderApp:
                 if staging_output is not None:
                     promote_staged_output(final_output, staging_output)
                     self.log(f"【状态】结果目录已替换为本次抓取内容：{final_output}")
+                # 状态必须在结果目录落定之后再写：否则停止/崩溃后状态说图已下载，图却被丢弃，
+                # 下次「同日复抓」既不会补下载也不会重扫（last_message_id 已推进），当天图片永久缺失。
+                if status_payload is not None:
+                    try:
+                        save_capture_status(status_path, status_payload)
+                    except (OSError, ValueError) as exc:
+                        # 图片已经下载完成，状态写失败不能把整轮判成失败：只告警，让用户手动复抓。
+                        self.log(f"【状态】抓取状态保存失败：{status_path}（{type(exc).__name__}: {exc}）；"
+                                 "本次状态未成功更新，图片已下载完成，请用「同日复抓」补齐状态")
+                    else:
+                        self.log(f"【状态】抓取状态已覆盖保存：{status_path}；日期 {target_day}；备注 {len(remarks)} 个")
                 return CaptureResult(
                     scanned,
                     len(downloaded_ids),

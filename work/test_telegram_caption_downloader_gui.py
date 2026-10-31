@@ -1679,7 +1679,7 @@ class GuiFlowTests(unittest.TestCase):
         self.app_directory.cleanup()
 
     def test_window_builds_and_validates_credentials(self):
-        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.9")
+        self.assertEqual(self.root.title(), "登录飞机提取图片 v5.4.10")
         self.assertEqual(
             self.app.output_path.get(),
             r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\结果",
@@ -5072,19 +5072,34 @@ class CaptureRecoveryTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].split("	"), ["known", "@a", "2"])
 
-    def test_capture_writes_a_checkpoint_during_the_download(self):
-        message = self.message(1)
-        with self.capture({"@a": [message]}, ["known"]):
-            checkpoints = []
+    def test_full_capture_never_writes_status_before_the_result_folder_is_ready(self):
+        with self.capture({"@a": [self.message(1)]}, ["known"]):
+            saves = []
             real_save = gui.save_capture_status
 
             def spy(path, payload):
-                if payload.get("checkpoint"):
-                    checkpoints.append(payload)
+                saves.append(payload)
                 return real_save(path, payload)
 
             with patch.object(gui, "save_capture_status", side_effect=spy):
                 self.app.start_download()
+            # 全量抓取先写临时目录：中途绝不能把「已下载」写进正式状态，否则停止/崩溃后
+            # 状态说图已下载、图却被丢弃，当天这些图永久缺失。
+            self.assertEqual([payload for payload in saves if payload.get("checkpoint")], [])
+            self.assertEqual(len(saves), 1)
+
+    def test_capture_writes_a_checkpoint_during_the_download(self):
+        # 第一次抓取失败 -> 备注状态为待复抓；再追加一条正常消息后做增量复抓，
+        # 这条路径会真的处理消息，从而在下载过程中写检查点。
+        messages = [self.message(1, fail=True)]
+        with self.capture({"@a": messages}, ["known"]):
+            self.app.start_download()
+            messages.append(self.message(2))
+            with patch.object(gui, "save_capture_status", wraps=gui.save_capture_status) as spy:
+                self.app.start_download(retry=True)
+            checkpoints = [
+                call.args[1] for call in spy.call_args_list if call.args[1].get("checkpoint")
+            ]
             self.assertTrue(checkpoints)
             self.assertTrue(checkpoints[-1]["checkpoint"])
 
@@ -5431,9 +5446,14 @@ class OptimizationRegressionTests(unittest.TestCase):
                 return real_replace(source, target)
 
             with patch("telegram_caption_downloader_gui.os.replace", side_effect=flaky_replace):
-                with self.assertRaises(OSError):
+                with self.assertRaises(RuntimeError) as raised:
                     promote_staged_output(final, staging)
             self.assertEqual((final / "old.txt").read_text(encoding="utf-8"), "old")
+            # 本次下载的图片不能悄悄丢掉：改名保留，并在报错里给出路径。
+            kept = [item for item in Path(directory).iterdir() if "__本次结果" in item.name]
+            self.assertEqual(len(kept), 1)
+            self.assertEqual((kept[0] / "new.txt").read_text(encoding="utf-8"), "new")
+            self.assertIn(str(kept[0]), str(raised.exception))
 
     def test_preview_store_spills_to_disk_and_cleans_up(self):
         store = PreviewStore()
@@ -5548,7 +5568,7 @@ class OptimizationRegressionTests(unittest.TestCase):
             settings = load_group_settings(root)
             save_group_profile(root, settings, "", "备份群", "@backup")
             group_file = root / "群配置" / "groups.json"
-            backup = group_file.with_name(group_file.name + ".bak_20260101")
+            backup = group_file.with_name(group_file.name + ".bak_99991231")
             backup.write_bytes(group_file.read_bytes())
             group_file.write_text('{"broken":', encoding="utf-8")
             recovered = load_group_settings(root)
